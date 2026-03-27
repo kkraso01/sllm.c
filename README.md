@@ -298,6 +298,15 @@ cc -Ofast -fopenmp dev/test/tiny_alc_e2e.c -lm -lgomp -o dev/test/tiny_alc_e2e
 
 The tiny test validates ALC-on/off behavioral divergence, ALC write-state effects, gradient update plumbing for ALC fusion tensors, and persistence round-trip correctness.
 
+Artifact-independent hardening validation (math/stability pass):
+
+```bash
+cc -Ofast -fopenmp dev/test/alc_hardening.c -lm -lgomp -o dev/test/alc_hardening
+./dev/test/alc_hardening
+```
+
+The hardening suite adds finite-difference gradient checks (representative subset), EMA edge-case validation (`eta=0/1/small`), strict persistence identity checks, and a long-run stability stress run with norm/gate/index monitoring.
+
 See `docs/adaptive_learning_component.md` for the full architecture/design notes and `docs/alc_change_log.md` for implementation-level change tracking.
 
 ## discussions

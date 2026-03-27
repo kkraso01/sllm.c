@@ -779,6 +779,43 @@ static float alc_sigmoid(float x) {
     return 1.0f / (1.0f + expf(-x));
 }
 
+static void alc_fail(const char* msg) {
+    fprintf(stderr, "[ALC] %s\n", msg);
+    exit(1);
+}
+
+static void alc_require(int cond, const char* msg) {
+    if (!cond) { alc_fail(msg); }
+}
+
+static void alc_check_finite_scalar(float x, const char* name) {
+    if (!isfinite(x)) {
+        fprintf(stderr, "[ALC] non-finite value in %s\n", name);
+        exit(1);
+    }
+}
+
+static void alc_check_finite_buffer(const float* x, size_t n, const char* name) {
+    for (size_t i = 0; i < n; i++) {
+        if (!isfinite(x[i])) {
+            fprintf(stderr, "[ALC] non-finite value in %s at idx=%zu\n", name, i);
+            exit(1);
+        }
+    }
+}
+
+static float alc_l2_norm(const float* x, int n) {
+    float ss = 0.0f;
+    for (int i = 0; i < n; i++) { ss += x[i] * x[i]; }
+    return sqrtf(ss);
+}
+
+static float alc_clamp(float x, float lo, float hi) {
+    if (x < lo) { return lo; }
+    if (x > hi) { return hi; }
+    return x;
+}
+
 static int alc_layer_enabled(const GPT2* model, int layer) {
     if (!model->alc_config.use_alc) { return 0; }
     int every = model->alc_config.alc_apply_every_n_layers;
@@ -844,6 +881,13 @@ static void gpt2_validate_alc_config(const GPT2* model) {
         exit(1);
     }
     if (model->config.channels <= 0) { fprintf(stderr, "[ALC] invalid model channels=%d\n", model->config.channels); exit(1); }
+    alc_require(cfg->alc_slot_dim > 0 && cfg->alc_key_dim > 0, "invalid dimensions: slot_dim/key_dim must be > 0");
+    alc_require(cfg->alc_num_slots > 0, "invalid dimensions: num_slots must be > 0");
+    alc_require(cfg->alc_update_rate >= 0.0f && cfg->alc_update_rate <= 1.0f, "invalid update rate: must be in [0,1]");
+    alc_require(cfg->alc_fusion_mode == ALC_FUSION_ADDITIVE || cfg->alc_fusion_mode == ALC_FUSION_GATED,
+                "invalid fusion mode");
+    alc_require(cfg->alc_update_mode >= ALC_UPDATE_OFF && cfg->alc_update_mode <= ALC_UPDATE_ALWAYS,
+                "invalid update mode");
 }
 
 static void gpt2_init_alc_state(GPT2* model, int B, int T) {
@@ -948,7 +992,18 @@ static void alc_forward_read_and_fuse(GPT2* model, float* hidden, int B, int T, 
     int K = model->alc_config.alc_key_dim;
     int C = model->config.channels;
     int BT = B * T;
+    const float routing_scale = 1.0f / sqrtf((float)K);
+    const float gate_logit_abs_cap = 40.0f; // keeps sigmoid numerically stable in fp32
+    const float additive_norm_ratio_cap = 100.0f; // very loose safety guard to prevent runaway fusion
     model->alc.forward_calls++;
+    alc_require(model->alc.initialized, "forward called before ALC initialization");
+    alc_require(layer >= 0 && layer < model->config.num_layers, "layer index out of bounds");
+    alc_require(model->alc_config.alc_update_rate >= 0.0f && model->alc_config.alc_update_rate <= 1.0f,
+                "alc_update_rate out of range in forward");
+    alc_require(model->alc_config.alc_fusion_mode == ALC_FUSION_ADDITIVE || model->alc_config.alc_fusion_mode == ALC_FUSION_GATED,
+                "invalid fusion mode in forward");
+    alc_require(model->alc_config.alc_update_mode >= ALC_UPDATE_OFF && model->alc_config.alc_update_mode <= ALC_UPDATE_ALWAYS,
+                "invalid update mode in forward");
     float* layer_hidden_pre = model->alc.hidden_pre_layers + (size_t)layer * BT * C;
     float* layer_retrieved = model->alc.retrieved_layers + (size_t)layer * BT * C;
     int* layer_slots = model->alc.selected_slots_layers + (size_t)layer * BT;
@@ -968,8 +1023,11 @@ static void alc_forward_read_and_fuse(GPT2* model, float* hidden, int B, int T, 
             const float* sk = model->alc.slot_keys + (size_t)s * K;
             float score = 0.0f;
             for (int k = 0; k < K; k++) { score += q[k] * sk[k]; }
+            score *= routing_scale;
+            alc_check_finite_scalar(score, "routing_scores");
             if (score > best_score) { best_score = score; best_slot = s; }
         }
+        alc_require(best_slot >= 0 && best_slot < S, "selected slot index out of bounds");
         model->alc.selected_slots[bt] = best_slot;
         layer_slots[bt] = best_slot;
         if (model->alc.slot_hit_counts != NULL) { model->alc.slot_hit_counts[best_slot]++; }
@@ -981,17 +1039,27 @@ static void alc_forward_read_and_fuse(GPT2* model, float* hidden, int B, int T, 
             for (int d = 0; d < D; d++) { mapped += proj[d] * slot[d]; }
             retrieved[c] = mapped;
         }
+        alc_check_finite_buffer(retrieved, (size_t)C, "retrieved_buffer");
         memcpy(layer_retrieved + (size_t)bt * C, retrieved, (size_t)C * sizeof(float));
         if (model->alc_config.alc_fusion_mode == ALC_FUSION_ADDITIVE) {
+            float h_norm = alc_l2_norm(h, C);
+            float r_norm = alc_l2_norm(retrieved, C);
+            float scale = model->alc_config.alc_additive_scale;
+            if (r_norm > additive_norm_ratio_cap * (h_norm + 1e-6f)) {
+                scale *= (additive_norm_ratio_cap * (h_norm + 1e-6f)) / (r_norm + 1e-12f);
+            }
             for (int c = 0; c < C; c++) {
-                h[c] += model->alc_config.alc_additive_scale * retrieved[c];
+                h[c] += scale * retrieved[c];
             }
         } else {
             for (int c = 0; c < C; c++) {
-                float gate = alc_sigmoid(model->alc.gate_h[c] * h[c] + model->alc.gate_a[c] * retrieved[c] + model->alc.gate_b[c]);
+                float gate_logit = model->alc.gate_h[c] * h[c] + model->alc.gate_a[c] * retrieved[c] + model->alc.gate_b[c];
+                alc_check_finite_scalar(gate_logit, "gate_logits");
+                float gate = alc_sigmoid(alc_clamp(gate_logit, -gate_logit_abs_cap, gate_logit_abs_cap));
                 h[c] = gate * h[c] + (1.0f - gate) * retrieved[c];
             }
         }
+        alc_check_finite_buffer(h, (size_t)C, "fused_hidden");
     }
 }
 
@@ -1002,23 +1070,46 @@ static void alc_write_update(GPT2* model, float* hidden, int B, int T) {
     int C = model->config.channels;
     int BT = B * T;
     float eta = model->alc_config.alc_update_rate;
+    const float write_norm_cap = 1e6f;
+    const float slot_norm_cap = 1e6f;
+    const float key_norm_cap = 1e6f;
     model->alc.write_calls++;
     model->alc.total_writes += BT;
+    alc_require(eta >= 0.0f && eta <= 1.0f, "alc_update_rate out of range in write_update");
     for (int bt = 0; bt < BT; bt++) {
         int slot_idx = model->alc.selected_slots[bt];
+        alc_require(slot_idx >= 0 && slot_idx < model->alc_config.alc_num_slots, "selected slot index out of bounds in write_update");
         float* slot = model->alc.slots + (size_t)slot_idx * D;
         float* key = model->alc.slot_keys + (size_t)slot_idx * K;
         const float* q = model->alc.query_buffer + (size_t)bt * K;
         const float* h = hidden + (size_t)bt * C;
+        float write_norm_ss = 0.0f;
         for (int d = 0; d < D; d++) {
             const float* wrow = model->alc.write_proj + (size_t)d * C;
             float projected = 0.0f;
             for (int j = 0; j < C; j++) { projected += wrow[j] * h[j]; }
+            alc_check_finite_scalar(projected, "slot_write_projection");
+            write_norm_ss += projected * projected;
+            if (write_norm_ss > write_norm_cap * write_norm_cap) {
+                projected *= write_norm_cap / (sqrtf(write_norm_ss) + 1e-12f);
+            }
             slot[d] = (1.0f - eta) * slot[d] + eta * projected;
         }
         for (int k = 0; k < K; k++) {
             key[k] = (1.0f - eta) * key[k] + eta * q[k];
         }
+        float slot_norm = alc_l2_norm(slot, D);
+        float key_norm = alc_l2_norm(key, K);
+        if (slot_norm > slot_norm_cap) {
+            float mul = slot_norm_cap / (slot_norm + 1e-12f);
+            for (int d = 0; d < D; d++) { slot[d] *= mul; }
+        }
+        if (key_norm > key_norm_cap) {
+            float mul = key_norm_cap / (key_norm + 1e-12f);
+            for (int k = 0; k < K; k++) { key[k] *= mul; }
+        }
+        alc_check_finite_buffer(slot, (size_t)D, "slot_updates");
+        alc_check_finite_buffer(key, (size_t)K, "key_updates");
     }
 }
 
@@ -1027,14 +1118,17 @@ static void alc_backward_fuse_and_accumulate(GPT2* model, int layer, float* d_hi
     int BT = B * T;
     int C = model->config.channels;
     int D = model->alc_config.alc_slot_dim;
+    const float gate_logit_abs_cap = 40.0f;
     const float* layer_hidden_pre = model->alc.hidden_pre_layers + (size_t)layer * BT * C;
     const float* layer_retrieved = model->alc.retrieved_layers + (size_t)layer * BT * C;
     const int* layer_slots = model->alc.selected_slots_layers + (size_t)layer * BT;
+    alc_require(model->alc.d_slot_to_hidden != NULL, "missing grad buffer d_slot_to_hidden");
     for (int bt = 0; bt < BT; bt++) {
         float* d_h = d_hidden_out + (size_t)bt * C;
         const float* h_pre = layer_hidden_pre + (size_t)bt * C;
         const float* retrieved = layer_retrieved + (size_t)bt * C;
         int slot_idx = layer_slots[bt];
+        alc_require(slot_idx >= 0 && slot_idx < model->alc_config.alc_num_slots, "selected slot index out of bounds in backward");
         const float* slot = model->alc.slots + (size_t)slot_idx * D;
         for (int c = 0; c < C; c++) {
             float d_out = d_h[c];
@@ -1042,10 +1136,13 @@ static void alc_backward_fuse_and_accumulate(GPT2* model, int layer, float* d_hi
             if (model->alc_config.alc_fusion_mode == ALC_FUSION_GATED) {
                 float gh = model->alc.gate_h[c];
                 float ga = model->alc.gate_a[c];
-                float z = gh * h_pre[c] + ga * retrieved[c] + model->alc.gate_b[c];
+                float z_raw = gh * h_pre[c] + ga * retrieved[c] + model->alc.gate_b[c];
+                float z = alc_clamp(z_raw, -gate_logit_abs_cap, gate_logit_abs_cap);
                 float g = alc_sigmoid(z);
                 float d_g = d_out * (h_pre[c] - retrieved[c]);
                 float d_z = d_g * g * (1.0f - g);
+                if (z != z_raw) { d_z = 0.0f; }
+                alc_check_finite_scalar(d_z, "gate_grad_dz");
                 model->alc.d_gate_h[c] += d_z * h_pre[c];
                 model->alc.d_gate_a[c] += d_z * retrieved[c];
                 model->alc.d_gate_b[c] += d_z;
@@ -1057,6 +1154,7 @@ static void alc_backward_fuse_and_accumulate(GPT2* model, int layer, float* d_hi
                 d_proj_row[d] += d_retrieved * slot[d];
             }
         }
+        alc_check_finite_buffer(d_h, (size_t)C, "d_hidden_post_alc");
     }
 }
 
@@ -1172,6 +1270,14 @@ int gpt2_load_alc_state(GPT2* model, const char* path, int B, int T) {
     freadCheck(model->alc.gate_b, sizeof(float), (size_t)C, f);
     freadCheck(model->alc.slot_keys, sizeof(float), (size_t)S * K, f);
     freadCheck(model->alc.slots, sizeof(float), (size_t)S * D, f);
+    alc_check_finite_buffer(model->alc.query_proj, (size_t)K * C, "loaded.query_proj");
+    alc_check_finite_buffer(model->alc.write_proj, (size_t)D * C, "loaded.write_proj");
+    alc_check_finite_buffer(model->alc.slot_to_hidden, (size_t)C * D, "loaded.slot_to_hidden");
+    alc_check_finite_buffer(model->alc.gate_h, (size_t)C, "loaded.gate_h");
+    alc_check_finite_buffer(model->alc.gate_a, (size_t)C, "loaded.gate_a");
+    alc_check_finite_buffer(model->alc.gate_b, (size_t)C, "loaded.gate_b");
+    alc_check_finite_buffer(model->alc.slot_keys, (size_t)S * K, "loaded.slot_keys");
+    alc_check_finite_buffer(model->alc.slots, (size_t)S * D, "loaded.slots");
     int next = fgetc(f);
     if (next != EOF) {
         fprintf(stderr, "[ALC] incompatible state file '%s': trailing bytes detected\n", path);
