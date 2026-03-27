@@ -26,6 +26,7 @@ int main(void) {
     int T = 3;
     int C = model.config.channels;
     gpt2_init_alc_state(&model, B, T);
+    alc_ensure_layer_traces(&model, B, T);
 
     float hidden[2 * 3 * 8];
     for (int i = 0; i < B * T * C; i++) {
@@ -33,7 +34,7 @@ int main(void) {
     }
 
     // Read/fuse path should populate selected slots.
-    alc_forward_read_and_fuse(&model, hidden, B, T);
+    alc_forward_read_and_fuse(&model, hidden, B, T, 0);
     for (int bt = 0; bt < B * T; bt++) {
         assert(model.alc.selected_slots[bt] >= 0);
         assert(model.alc.selected_slots[bt] < model.alc_config.alc_num_slots);
