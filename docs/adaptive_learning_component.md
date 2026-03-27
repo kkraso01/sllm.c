@@ -1,150 +1,212 @@
 # Adaptive Learning Component (ALC) in `llm.c` CPU GPT-2 Path
 
-## Native-component completeness audit
+This document records the **implemented** ALC behavior in `train_gpt2.c`, with an explicit correctness/stability audit and test contracts.
 
-### What is fully native today vs partially native today
+## Training semantics (implemented)
 
-**Fully native in-model (integrated in runtime lifecycle):**
-- Config/env parsing + validation (`gpt2_set_alc_config`, `gpt2_validate_alc_config`).
-- Forward-path application in transformer block (`gpt2_forward` -> `alc_forward_read_and_fuse`).
-- Stateful write path (`alc_write_update`) with mode control (`off` / `train_only` / `always`).
-- Sidecar persistence (`gpt2_save_alc_state`, `gpt2_load_alc_state`).
-- Observability/logging (`[ALC]` banner + `[ALC][debug]` summaries).
-
-**Partially native (intentional hybrid semantics):**
-- Differentiable ALC fusion tensors are only **partially** gradient-trained (details below).
-- Discrete routing and memory-state tensors are still non-backprop stateful memory.
-
-## Training semantics
-
-### Gradient-trained in this pass
-
-These tensors now receive explicit gradients during `gpt2_backward` and are updated in `gpt2_update` via an ALC-local AdamW path that runs in the same step lifecycle as GPT-2 core updates:
-
+Gradient-trained tensors (updated by `alc_adamw_update` in `gpt2_update`):
 - `slot_to_hidden` `(C, D)`
 - `gate_h`, `gate_a`, `gate_b` `(C)` when `alc_fusion_mode=gated`
 
-Implementation points:
-- Backward hook per layer: `alc_backward_fuse_and_accumulate(...)`.
-- Gradient buffer init: `alc_ensure_grad_buffers(...)`.
-- Gradient reset: `alc_zero_param_grads(...)` from `gpt2_zero_grad(...)`.
-- Optimizer step: `alc_adamw_update(...)` called from `gpt2_update(...)`.
-
-### Stateful/non-gradient tensors
-
-These remain explicit memory/runtime state, not AdamW-trained tensors:
+State-updated tensors (updated by EMA write rule in `alc_write_update`):
 - `slots` `(S, D)`
 - `slot_keys` `(S, K)`
 
-They are updated by EMA write-back (`alc_write_update`) according to `alc_update_mode` and `alc_update_rate`.
-
-### Not gradient-trained (by design in this pass)
-
+Not gradient-trained in this pass:
 - `query_proj` `(K, C)`
 - `write_proj` `(D, C)`
 
-Reason: current routing uses hard argmax slot selection (`selected_slots`) and state mutation through selected-slot writes. In this CPU reference path, no surrogate gradient / soft routing was introduced, to keep baseline architecture stable and deterministic.
+## Mathematical correctness audit
 
-## ALC gradient-integration feasibility audit
+Notation (for a token-position `bt`):
+- hidden input: `h_in ∈ R^C`
+- query projection: `W_q = query_proj ∈ R^{K×C}`
+- keys: `K_s = slot_keys[s] ∈ R^K`
+- slot memory: `m_s = slots[s] ∈ R^D`
+- slot-to-hidden map: `W_sh = slot_to_hidden ∈ R^{C×D}`
+- write projection: `W_w = write_proj ∈ R^{D×C}`
+- update rate: `η = alc_update_rate ∈ [0,1]`
 
-### 1) Differentiable path membership (current math)
+### Forward equations: routing and retrieval
 
-From `gpt2_forward` block order:
+1. Query:
 
-```text
-... residual3 -> ALC read/fuse -> next layer / final LN
-```
+`q = W_q h_in`
 
-Inside `alc_forward_read_and_fuse`:
-- `slot_to_hidden` always participates in differentiable affine map `retrieved = W_slot_to_hidden * slot[selected]`.
-- `gate_h/gate_a/gate_b` participate in differentiable gated fusion when gated mode is enabled.
-- `query_proj` contributes to query vector for slot scoring/selection (hard argmax), making gradient path through routing non-smooth/discrete.
-- `write_proj` is used in post-fuse write update into memory state; effects couple across layers via mutable memory, but through selected slots and state updates, not currently represented in dense autograd buffers.
+2. Routing score per slot (implemented with scale):
 
-### 2) Backward support needed
+`score_s = (q · K_s) / sqrt(K)`
 
-To gradient-train differentiable fusion tensors with minimal intrusion, backward needed:
-- Per-layer cached traces of ALC pre-fusion hidden, retrieved vector, and selected slot index.
-- Layer-local backward transform from `d(hidden_out)` to `d(hidden_in)` at ALC boundary.
-- Parameter gradient accumulation for `slot_to_hidden` and gated weights.
+3. Slot selection:
 
-### 3) Minimal invasive path
+`s* = argmax_s score_s`
 
-Implemented path:
-- Add ALC-local per-layer trace buffers (outside global `ActivationTensors`, to avoid destabilizing baseline tensor layout).
-- Inject a single backward call before existing `residual_backward(...)` in each layer.
-- Add ALC-local AdamW updates in `gpt2_update(...)` after baseline GPT parameter update loop.
+4. Retrieved hidden vector:
 
-### 4) Feasibility/stability assessment
+`r = W_sh m_{s*}`
 
-This is cleanly feasible for `slot_to_hidden` + gated weights, and was implemented.
+### Forward equations: fusion modes
 
-`query_proj` / `write_proj` full gradient integration would require introducing soft routing and/or surrogate-gradient semantics (or full differentiable memory dynamics) and would be materially more invasive for this pass.
+#### Additive mode (`alc_fusion_mode=additive`)
 
-## Final chosen training design
+Implemented base equation:
 
-**Chosen path: Path A (partial real gradient integration + explicit hybrid boundary).**
+`h_out = h_in + α r`, where `α = alc_additive_scale`
 
-- Real gradients and AdamW updates are now present for the differentiable fusion parameters (`slot_to_hidden`, gated weights).
-- Memory-state tensors remain EMA-managed adaptive state.
-- Routing/write projections are explicitly documented as non-backprop in this pass.
+Implemented stability guard:
+- if `||r||_2 > 100 * (||h_in||_2 + 1e-6)`, scale `α` down so that the effective retrieved norm ratio is capped at 100.
 
-This avoids the previous ambiguous middle state by making trained-vs-stateful boundaries explicit in code and docs.
+#### Gated mode (`alc_fusion_mode=gated`)
+
+Per channel `c`:
+
+`z_c_raw = gate_h[c] * h_in[c] + gate_a[c] * r[c] + gate_b[c]`
+
+`z_c = clamp(z_c_raw, -40, 40)`
+
+`g_c = sigmoid(z_c)`
+
+`h_out[c] = g_c * h_in[c] + (1 - g_c) * r[c]`
+
+### Write/update equations
+
+Writes happen only when the layer is ALC-enabled **and** update-mode policy allows writes:
+- `update_mode=off`: never
+- `update_mode=train_only`: only when `targets != NULL` (training forward)
+- `update_mode=always`: always
+
+Within `alc_write_update`, for each active token `bt` with selected slot `s*`:
+
+`w = W_w h_out`
+
+`m_{s*} <- (1-η) m_{s*} + η w`
+
+`K_{s*} <- (1-η) K_{s*} + η q`
+
+Non-selected slots/keys are unchanged for that token update.
+
+Additional safety caps:
+- write vector magnitude soft-capped (very loose cap: `1e6`)
+- post-update slot/key vector norms capped at `1e6`
+
+### Backward equations for gradient-trained tensors
+
+Implemented in `alc_backward_fuse_and_accumulate` using cached per-layer traces (`h_in`, `r`, selected slot id):
+
+- additive path: `∂L/∂r = α * ∂L/∂h_out`
+- gated path uses channelwise chain rule from
+  `h_out = g*h_in + (1-g)*r`, `g=sigmoid(clamp(z_raw,-40,40))`
+- for clamp saturation (`|z_raw| > 40`), derivative through clamp is zero
+- `slot_to_hidden` gradient accumulates as outer product with selected slot state
+
+### Correctness reconciliation notes
+
+The design doc now matches implementation details that were previously implicit:
+- routing includes `/sqrt(K)` scaling
+- gated forward/backward both include gate-logit clamp at `[-40, 40]`
+- additive path includes explicit norm-ratio safety scaling
+- write updates include explicit high-cap norm guards
+
+## Numerical stability decisions
+
+1. **Routing score scaling** (`/sqrt(K)`):
+   - keeps score magnitude stable as key dimension grows.
+
+2. **Gate logit clamp** (`[-40,40]`) before sigmoid:
+   - avoids exp overflow/underflow and stabilizes gradient behavior.
+
+3. **Additive fusion norm-ratio guard**:
+   - prevents rare runaway when retrieved vector is disproportionately large vs hidden state.
+
+4. **EMA write/state high-cap norm guards** (`1e6`):
+   - fail-safe prevention of long-run catastrophic drift without changing typical behavior.
+
+5. **Finite checks with `[ALC]` errors**:
+   - routing scores, gate logits, fused hidden, slot/key updates, and loaded tensors are checked for NaN/Inf.
 
 ## Persistence contract
 
-ALC sidecar format is a binary `ALC1` contract (`version=1`) with strict compatibility checks.
+ALC sidecar format is a binary `ALC1` (`version=1`) with strict checks:
+- magic/version/endian/header-size
+- exact config match (`C,S,D,K,fusion_mode,update_mode`)
+- no trailing bytes
+- loaded tensor finiteness verification
 
-### Header checks
-
-On load, runtime validates:
-- `magic == ALC1`
-- `version == 1`
-- `endian_marker == 0x01020304`
-- `header_bytes == sizeof(ALCCheckpointHeader)`
-- exact config match for `channels`, `num_slots`, `slot_dim`, `key_dim`, `fusion_mode`, `update_mode`
-- no trailing bytes after expected payload
-
-### Serialized tensor order (exact)
-
-1. `query_proj` `(K, C)`
-2. `write_proj` `(D, C)`
-3. `slot_to_hidden` `(C, D)`
+Serialized tensor order:
+1. `query_proj` `(K,C)`
+2. `write_proj` `(D,C)`
+3. `slot_to_hidden` `(C,D)`
 4. `gate_h` `(C)`
 5. `gate_a` `(C)`
 6. `gate_b` `(C)`
-7. `slot_keys` `(S, K)`
-8. `slots` `(S, D)`
-
-This sidecar saves both ALC parameters and ALC memory state.
+7. `slot_keys` `(S,K)`
+8. `slots` `(S,D)`
 
 ## Validation matrix
 
-### Artifact-independent tests
-
-Build + run tiny integrated path:
-
-```bash
-cc -Ofast -fopenmp dev/test/tiny_alc_e2e.c -lm -lgomp -o dev/test/tiny_alc_e2e
-./dev/test/tiny_alc_e2e
-```
-
-What it validates:
-- ALC-off vs ALC-on behavioral divergence (`logits` differ).
-- ALC stateful writes change subsequent behavior deterministically.
-- ALC fusion parameters receive non-zero gradients and update after optimizer step.
-- Core GPT parameters still update in same training loop.
-- Save/load round-trip preserves persisted tensors exactly.
-- Loaded model can immediately run a successful forward pass.
-
-Additional smoke path:
+### Existing tiny integration + smoke
 
 ```bash
 cc -Ofast -fopenmp dev/test/alc_smoke.c -lm -lgomp -o dev/test/alc_smoke
 ./dev/test/alc_smoke
+
+cc -Ofast -fopenmp dev/test/tiny_alc_e2e.c -lm -lgomp -o dev/test/tiny_alc_e2e
+./dev/test/tiny_alc_e2e
 ```
 
-## Environment variables (single place)
+### Hardening test suite (artifact-independent)
+
+```bash
+cc -Ofast -fopenmp dev/test/alc_hardening.c -lm -lgomp -o dev/test/alc_hardening
+./dev/test/alc_hardening
+```
+
+Coverage in `alc_hardening.c`:
+
+1. **Gradient-check coverage** (representative subset):
+   - tensors: `slot_to_hidden`, `gate_h`, `gate_a`, `gate_b`
+   - checks finite analytic grads
+   - checks non-zero gate gradient presence under synthetic setup
+   - checks finite-difference agreement on representative indices
+   - tolerances: `abs_tol=2e-3`, `rel_tol=2e-2`
+
+2. **EMA stability/correctness analysis**:
+   - `η=0` => no change
+   - `η=1` => selected slot/key exact overwrite
+   - small `η` repeated writes converge toward write vector
+   - non-selected slots remain unchanged
+
+3. **Persistence test contract**:
+   - save from model ALC state
+   - load into fresh model with matching config
+   - assert exact tensor equality for all persisted tensors
+   - assert exact logits equality on same input post-load
+
+4. **Long-run stability stress summary**:
+   - 800 repeated ALC-enabled forwards with writes
+   - tracks max slot norm, max key norm, max fused hidden norm, gate min/max/mean, slot-hit histogram summary
+   - fails on NaN/Inf, invalid slot index, or norm threshold breaches
+   - thresholds: `1e4` for slot/key/fused norms (far below hard cap, chosen as practical explosion detector)
+
+## Proven invariants
+
+The following are now enforced by code and/or tests:
+
+- Config invariants: valid dimensions, valid fusion/update modes, `alc_update_rate ∈ [0,1]`.
+- Runtime invariants: selected slot indices always in `[0, S-1]`.
+- Finite-value invariants at key stages (routing, gating, fusion, writes, load).
+- EMA semantics invariants for `η ∈ {0,1}` and non-selected slot immutability.
+- Persistence invariants: strict contract checks + exact round-trip identity under matching config.
+- Long-run boundedness invariants: no NaN/Inf and norms remain under stress thresholds.
+
+## Remaining mathematically known limitations
+
+- Routing is hard argmax and non-differentiable; `query_proj` is intentionally not trained by backprop in this pass.
+- Write dynamics are stateful EMA updates external to dense autograd; `write_proj` is not backprop-trained.
+- Finite-difference gradient checks cover representative subsets, not every parameter element.
+- Additive and write-state guards are high-level safety protections, not formal Lyapunov guarantees.
+
+## Environment variables
 
 - `LLMC_USE_ALC`
 - `LLMC_ALC_NUM_SLOTS`
@@ -158,20 +220,3 @@ cc -Ofast -fopenmp dev/test/alc_smoke.c -lm -lgomp -o dev/test/alc_smoke
 - `LLMC_ALC_STATE_IN`
 - `LLMC_ALC_STATE_OUT`
 - `LLMC_ALC_DEBUG`
-
-## Forward ordering note (for future MoE/Engram)
-
-Current intended extension region ordering remains:
-
-```text
-attention -> FFN/MoE -> Engram(optional) -> ALC(optional) -> residual continuation
-```
-
-ALC remains the post-FFN/post-Engram fusion point in this CPU path.
-
-## Future work
-
-- Soft routing / temperature-controlled top-k routing for differentiable query/key learning.
-- Optional surrogate-gradient mode for hard routing.
-- Decision whether to fold selected ALC tensors into checkpoint-native GPT tensor layouts.
-- Broader gradient coverage for memory-write dynamics (`write_proj`) once routing semantics are formalized.
