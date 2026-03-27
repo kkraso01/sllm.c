@@ -264,10 +264,10 @@ This clone includes an **optional in-model Adaptive Learning Component (ALC)** i
 
 ALC is feature-gated and disabled by default, preserving baseline behavior.
 
-Training behavior in current CPU path is intentionally hybrid:
-- **Gradient-trained:** `slot_to_hidden`, and (`gate_h`, `gate_a`, `gate_b`) in gated mode.
-- **EMA/state-updated memory:** `slots`, `slot_keys`.
-- **Not backprop-trained in this pass:** `query_proj`, `write_proj` (hard routing/write-state coupling remains explicit).
+Training behavior in current CPU path is hybrid:
+- **Gradient-trained:** `slot_to_hidden`; (`gate_h`, `gate_a`, `gate_b`) in gated mode; and `query_proj` when routing mode is soft (`softmax` / `topk_softmax`).
+- **EMA/state-updated memory:** `slots`, `slot_keys` via routing-weighted write updates.
+- **Not backprop-trained in this pass:** `write_proj`.
 
 Quick usage:
 
@@ -280,14 +280,14 @@ LLMC_USE_ALC=1 ./train_gpt2
 ```
 
 Additional tuning knobs are exposed through environment variables:
-`LLMC_ALC_NUM_SLOTS`, `LLMC_ALC_SLOT_DIM`, `LLMC_ALC_KEY_DIM`, `LLMC_ALC_UPDATE_RATE`, `LLMC_ALC_FUSION_MODE`, `LLMC_ALC_UPDATE_MODE`, `LLMC_ALC_APPLY_EVERY_N_LAYERS`, and `LLMC_ALC_ADDITIVE_SCALE`.
+`LLMC_ALC_NUM_SLOTS`, `LLMC_ALC_SLOT_DIM`, `LLMC_ALC_KEY_DIM`, `LLMC_ALC_UPDATE_RATE`, `LLMC_ALC_FUSION_MODE`, `LLMC_ALC_UPDATE_MODE`, `LLMC_ALC_ROUTING_MODE`, `LLMC_ALC_TOPK`, `LLMC_ALC_TEMPERATURE`, `LLMC_ALC_APPLY_EVERY_N_LAYERS`, and `LLMC_ALC_ADDITIVE_SCALE`.
 
 Persistence/debug knobs:
 - `LLMC_ALC_STATE_IN`, `LLMC_ALC_STATE_OUT` for explicit ALC sidecar load/save
 - `LLMC_ALC_DEBUG=1` for periodic ALC observability summaries
 
 Complete ALC env var list:
-`LLMC_USE_ALC`, `LLMC_ALC_NUM_SLOTS`, `LLMC_ALC_SLOT_DIM`, `LLMC_ALC_KEY_DIM`, `LLMC_ALC_UPDATE_RATE`, `LLMC_ALC_FUSION_MODE`, `LLMC_ALC_UPDATE_MODE`, `LLMC_ALC_APPLY_EVERY_N_LAYERS`, `LLMC_ALC_ADDITIVE_SCALE`, `LLMC_ALC_STATE_IN`, `LLMC_ALC_STATE_OUT`, `LLMC_ALC_DEBUG`.
+`LLMC_USE_ALC`, `LLMC_ALC_NUM_SLOTS`, `LLMC_ALC_SLOT_DIM`, `LLMC_ALC_KEY_DIM`, `LLMC_ALC_UPDATE_RATE`, `LLMC_ALC_FUSION_MODE`, `LLMC_ALC_UPDATE_MODE`, `LLMC_ALC_ROUTING_MODE`, `LLMC_ALC_TOPK`, `LLMC_ALC_TEMPERATURE`, `LLMC_ALC_APPLY_EVERY_N_LAYERS`, `LLMC_ALC_ADDITIVE_SCALE`, `LLMC_ALC_STATE_IN`, `LLMC_ALC_STATE_OUT`, `LLMC_ALC_DEBUG`.
 
 Artifact-independent tiny e2e validation:
 
@@ -305,7 +305,7 @@ cc -Ofast -fopenmp dev/test/alc_hardening.c -lm -lgomp -o dev/test/alc_hardening
 ./dev/test/alc_hardening
 ```
 
-The hardening suite adds finite-difference gradient checks (representative subset), EMA edge-case validation (`eta=0/1/small`), strict persistence identity checks, and a long-run stability stress run with norm/gate/index monitoring.
+The hardening suite adds finite-difference gradient checks (representative subset), routing normalization/top-k checks, `query_proj` gradient-path checks, weighted-write edge-case validation (`eta=0/1/small`), strict persistence identity checks, and a long-run stability stress run with norm/gate/index monitoring.
 
 See `docs/adaptive_learning_component.md` for the full architecture/design notes and `docs/alc_change_log.md` for implementation-level change tracking.
 

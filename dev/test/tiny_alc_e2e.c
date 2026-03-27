@@ -56,6 +56,9 @@ int main(void) {
     alc.alc_fusion_mode = ALC_FUSION_GATED;
     alc.alc_update_mode = ALC_UPDATE_ALWAYS;
     alc.alc_apply_every_n_layers = 1;
+    alc.alc_routing_mode = ALC_ROUTING_TOPK_SOFTMAX;
+    alc.alc_topk = 3;
+    alc.alc_temperature = 0.8f;
     gpt2_set_alc_config(&model, alc);
 
     // With ALC on, behavior should diverge from ALC-off behavior under identical inputs.
@@ -68,7 +71,8 @@ int main(void) {
     gpt2_backward(&model);
     assert(model.alc.d_slot_to_hidden != NULL);
     assert(model.alc.d_gate_h != NULL);
-    assert(model.alc.d_slot_to_hidden[0] != 0.0f || model.alc.d_gate_h[0] != 0.0f);
+    assert(model.alc.d_query_proj != NULL);
+    assert(model.alc.d_slot_to_hidden[0] != 0.0f || model.alc.d_gate_h[0] != 0.0f || model.alc.d_query_proj[0] != 0.0f);
     gpt2_update(&model, 1e-3f, 0.9f, 0.999f, 1e-8f, 0.0f, 2);
     assert(model.params.wte[0] != wte_before);
     assert(model.alc.slot_to_hidden[0] != slot_to_hidden_before || model.alc.gate_h[0] != gate_h_before);

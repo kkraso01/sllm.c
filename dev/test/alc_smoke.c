@@ -20,6 +20,9 @@ int main(void) {
         .alc_update_mode = ALC_UPDATE_ALWAYS,
         .alc_apply_every_n_layers = 1,
         .alc_additive_scale = 1.0f,
+        .alc_routing_mode = ALC_ROUTING_TOPK_SOFTMAX,
+        .alc_topk = 2,
+        .alc_temperature = 1.0f,
     };
 
     int B = 2;
@@ -38,6 +41,15 @@ int main(void) {
     for (int bt = 0; bt < B * T; bt++) {
         assert(model.alc.selected_slots[bt] >= 0);
         assert(model.alc.selected_slots[bt] < model.alc_config.alc_num_slots);
+        float psum = 0.0f;
+        int active = 0;
+        for (int s = 0; s < model.alc_config.alc_num_slots; s++) {
+            float p = model.alc.routing_probs[bt * model.alc_config.alc_num_slots + s];
+            if (p > 0.0f) { active++; }
+            psum += p;
+        }
+        assert(active <= model.alc_config.alc_topk);
+        assert(fabsf(psum - 1.0f) < 1e-4f);
     }
 
     // Write path should update at least one selected slot value.

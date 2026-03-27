@@ -52,6 +52,9 @@ static void test_gradient_fd(void) {
         .alc_update_mode = ALC_UPDATE_ALWAYS,
         .alc_apply_every_n_layers = 1,
         .alc_additive_scale = 1.0f,
+        .alc_routing_mode = ALC_ROUTING_TOPK_SOFTMAX,
+        .alc_topk = 2,
+        .alc_temperature = 1.0f,
     };
     int B = 1;
     int T = 2;
@@ -81,13 +84,25 @@ static void test_gradient_fd(void) {
 
     float d_hidden_out[2 * 4];
     for (int i = 0; i < BT * C; i++) { d_hidden_out[i] = 1.0f; }
-    alc_zero_param_grads(&model.alc, C, model.alc_config.alc_slot_dim);
+    alc_zero_param_grads(&model.alc, C, model.alc_config.alc_slot_dim, model.alc_config.alc_key_dim);
     alc_backward_fuse_and_accumulate(&model, 0, d_hidden_out, B, T);
 
     assert(all_finite(model.alc.d_slot_to_hidden, (size_t)C * model.alc_config.alc_slot_dim));
     assert(all_finite(model.alc.d_gate_h, (size_t)C));
     assert(all_finite(model.alc.d_gate_a, (size_t)C));
     assert(all_finite(model.alc.d_gate_b, (size_t)C));
+    assert(all_finite(model.alc.d_query_proj, (size_t)model.alc_config.alc_key_dim * C));
+    assert(fabsf(model.alc.d_query_proj[0]) > 1e-7f);
+    // top-k routing mask and normalization checks
+    int active = 0;
+    float psum = 0.0f;
+    for (int s = 0; s < model.alc_config.alc_num_slots; s++) {
+        float p = model.alc.routing_probs[s];
+        if (p > 0.0f) { active++; }
+        psum += p;
+    }
+    assert(active <= model.alc_config.alc_topk);
+    assert(fabsf(psum - 1.0f) < 1e-4f);
     int any_gate_nonzero = 0;
     for (int i = 0; i < C; i++) {
         if (fabsf(model.alc.d_gate_h[i]) > 1e-7f || fabsf(model.alc.d_gate_a[i]) > 1e-7f || fabsf(model.alc.d_gate_b[i]) > 1e-7f) {
@@ -153,6 +168,9 @@ static void test_ema_update_rules(void) {
         .alc_update_mode = ALC_UPDATE_ALWAYS,
         .alc_apply_every_n_layers = 1,
         .alc_additive_scale = 1.0f,
+        .alc_routing_mode = ALC_ROUTING_TOPK_SOFTMAX,
+        .alc_topk = 2,
+        .alc_temperature = 1.0f,
     };
     int B = 1, T = 1;
     gpt2_init_alc_state(&model, B, T);
@@ -165,9 +183,11 @@ static void test_ema_update_rules(void) {
     memset(model.alc.slot_keys, 0, (size_t)model.alc_config.alc_num_slots * model.alc_config.alc_key_dim * sizeof(float));
 
     float hidden[2] = { 2.0f, -4.0f };
-    model.alc.selected_slots[0] = 1;
     model.alc.query_buffer[0] = 1.0f;
     model.alc.query_buffer[1] = -3.0f;
+    model.alc.routing_probs[0] = 0.2f;
+    model.alc.routing_probs[1] = 0.8f;
+    model.alc.routing_probs[2] = 0.0f;
 
     // eta = 0 => no change
     model.alc_config.alc_update_rate = 0.0f;
@@ -179,15 +199,17 @@ static void test_ema_update_rules(void) {
     assert(max_abs_diff(before_slots, model.alc.slots, 6) == 0.0f);
     assert(max_abs_diff(before_keys, model.alc.slot_keys, 6) == 0.0f);
 
-    // eta = 1 => exact overwrite on selected slot only
+    // eta = 1 => weighted overwrite by routing probabilities
     model.alc_config.alc_update_rate = 1.0f;
     alc_write_update(&model, hidden, B, T);
-    assert(model.alc.slots[1 * 2 + 0] == hidden[0]);
-    assert(model.alc.slots[1 * 2 + 1] == hidden[1]);
-    assert(model.alc.slot_keys[1 * 2 + 0] == model.alc.query_buffer[0]);
-    assert(model.alc.slot_keys[1 * 2 + 1] == model.alc.query_buffer[1]);
-    // non-selected slots unchanged
-    assert(model.alc.slots[0] == 0.0f && model.alc.slots[1] == 0.0f);
+    assert(fabsf(model.alc.slots[0] - 0.4f) < 1e-7f);
+    assert(fabsf(model.alc.slots[1] + 0.8f) < 1e-7f);
+    assert(fabsf(model.alc.slots[2] - 1.6f) < 1e-7f);
+    assert(fabsf(model.alc.slots[3] + 3.2f) < 1e-7f);
+    assert(fabsf(model.alc.slot_keys[0] - 0.2f) < 1e-7f);
+    assert(fabsf(model.alc.slot_keys[1] + 0.6f) < 1e-7f);
+    assert(fabsf(model.alc.slot_keys[2] - 0.8f) < 1e-7f);
+    assert(fabsf(model.alc.slot_keys[3] + 2.4f) < 1e-7f);
     assert(model.alc.slots[4] == 0.0f && model.alc.slots[5] == 0.0f);
 
     // small eta repeated writes converge to write vector
@@ -196,9 +218,10 @@ static void test_ema_update_rules(void) {
     for (int i = 0; i < 400; i++) {
         alc_write_update(&model, hidden, B, T);
     }
-    assert(fabsf(model.alc.slots[1 * 2 + 0] - hidden[0]) < 1e-3f);
-    assert(fabsf(model.alc.slots[1 * 2 + 1] - hidden[1]) < 1e-3f);
-    assert(model.alc.slots[0] == 0.0f && model.alc.slots[1] == 0.0f);
+    assert(fabsf(model.alc.slots[0] - hidden[0]) < 2e-3f);
+    assert(fabsf(model.alc.slots[1] - hidden[1]) < 2e-3f);
+    assert(fabsf(model.alc.slots[2] - hidden[0]) < 2e-3f);
+    assert(fabsf(model.alc.slots[3] - hidden[1]) < 2e-3f);
     assert(model.alc.slots[4] == 0.0f && model.alc.slots[5] == 0.0f);
 
     gpt2_free(&model);
