@@ -532,6 +532,48 @@ typedef struct {
     int channels; // number of channels, e.g. 768
 } GPT2Config;
 
+typedef enum {
+    ALC_FUSION_ADDITIVE = 0,
+    ALC_FUSION_GATED = 1,
+} ALCFusionMode;
+
+typedef enum {
+    ALC_UPDATE_OFF = 0,
+    ALC_UPDATE_TRAIN_ONLY = 1,
+    ALC_UPDATE_ALWAYS = 2,
+} ALCUpdateMode;
+
+typedef struct {
+    int use_alc; // feature gate; keeps baseline path untouched when 0
+    int alc_num_slots; // number of adaptive slots in memory table
+    int alc_slot_dim; // dimensionality of stored adaptive slot vectors
+    int alc_key_dim; // dimensionality used for lookup keys
+    float alc_update_rate; // EMA update rate for write-back updates
+    int alc_fusion_mode; // see ALCFusionMode
+    int alc_update_mode; // see ALCUpdateMode
+    int alc_apply_every_n_layers; // apply ALC on every nth transformer layer
+    float alc_additive_scale; // scale for additive fusion
+} ALCConfig;
+
+typedef struct {
+    // learned projections (initialized at runtime, currently not loaded from checkpoint)
+    float* query_proj; // (K, C): maps hidden state -> ALC query/key space
+    float* write_proj; // (D, C): maps hidden state -> slot update vector
+    float* slot_to_hidden; // (C, D): maps retrieved slot back to hidden dim
+    float* gate_h; // (C): gated fusion coefficient for hidden state path
+    float* gate_a; // (C): gated fusion coefficient for retrieved slot path
+    float* gate_b; // (C): gated fusion bias
+    // adaptive state (continual-learning substrate)
+    float* slot_keys; // (S, K): slot lookup keys
+    float* slots; // (S, D): slot content vectors
+    // per-forward scratch and traces
+    float* query_buffer; // (B*T, K)
+    float* retrieved_buffer; // (B*T, C)
+    int* selected_slots; // (B*T)
+    int initialized;
+    int logged_enable_message;
+} ALCState;
+
 // the parameters of the model
 #define NUM_PARAMETER_TENSORS 16
 typedef struct {
@@ -677,6 +719,8 @@ float* malloc_and_point_activations(ActivationTensors* acts, size_t* act_sizes) 
 
 typedef struct {
     GPT2Config config;
+    ALCConfig alc_config;
+    ALCState alc;
     // the weights (parameters) of the model, and their sizes
     ParameterTensors params;
     size_t param_sizes[NUM_PARAMETER_TENSORS];
@@ -703,6 +747,140 @@ typedef struct {
     int* targets; // the target tokens for the current forward pass
     float mean_loss; // after a forward pass with targets, will be populated with the mean loss
 } GPT2;
+
+static float alc_sigmoid(float x) {
+    return 1.0f / (1.0f + expf(-x));
+}
+
+static int alc_layer_enabled(const GPT2* model, int layer) {
+    if (!model->alc_config.use_alc) { return 0; }
+    int every = model->alc_config.alc_apply_every_n_layers;
+    if (every <= 0) { return 0; }
+    return ((layer + 1) % every) == 0;
+}
+
+void gpt2_set_alc_config(GPT2 *model, ALCConfig config) {
+    model->alc_config = config;
+}
+
+static void gpt2_validate_alc_config(const GPT2* model) {
+    if (!model->alc_config.use_alc) { return; }
+    int C = model->config.channels;
+    assert(model->alc_config.alc_num_slots > 0);
+    assert(model->alc_config.alc_slot_dim > 0);
+    assert(model->alc_config.alc_key_dim > 0);
+    assert(model->alc_config.alc_update_rate >= 0.0f && model->alc_config.alc_update_rate <= 1.0f);
+    assert(model->alc_config.alc_apply_every_n_layers > 0);
+    assert(model->alc_config.alc_fusion_mode == ALC_FUSION_ADDITIVE || model->alc_config.alc_fusion_mode == ALC_FUSION_GATED);
+    assert(model->alc_config.alc_update_mode >= ALC_UPDATE_OFF && model->alc_config.alc_update_mode <= ALC_UPDATE_ALWAYS);
+    assert(C > 0);
+}
+
+static void gpt2_init_alc_state(GPT2* model, int B, int T) {
+    if (!model->alc_config.use_alc || model->alc.initialized) { return; }
+    gpt2_validate_alc_config(model);
+    int S = model->alc_config.alc_num_slots;
+    int D = model->alc_config.alc_slot_dim;
+    int K = model->alc_config.alc_key_dim;
+    int C = model->config.channels;
+    int BT = B * T;
+    uint64_t seed = 0x9E3779B97F4A7C15ull;
+    #define ALC_NEXT_RAND() (seed ^= seed << 7, seed ^= seed >> 9, ((seed & 0xFFFFFF) / (float)0x1000000))
+    model->alc.query_proj = (float*)mallocCheck((size_t)K * C * sizeof(float));
+    model->alc.write_proj = (float*)mallocCheck((size_t)D * C * sizeof(float));
+    model->alc.slot_to_hidden = (float*)mallocCheck((size_t)C * D * sizeof(float));
+    model->alc.gate_h = (float*)mallocCheck((size_t)C * sizeof(float));
+    model->alc.gate_a = (float*)mallocCheck((size_t)C * sizeof(float));
+    model->alc.gate_b = (float*)mallocCheck((size_t)C * sizeof(float));
+    model->alc.slot_keys = (float*)mallocCheck((size_t)S * K * sizeof(float));
+    model->alc.slots = (float*)calloc((size_t)S * D, sizeof(float));
+    model->alc.query_buffer = (float*)mallocCheck((size_t)BT * K * sizeof(float));
+    model->alc.retrieved_buffer = (float*)mallocCheck((size_t)BT * C * sizeof(float));
+    model->alc.selected_slots = (int*)mallocCheck((size_t)BT * sizeof(int));
+    for (int i = 0; i < K * C; i++) { model->alc.query_proj[i] = (ALC_NEXT_RAND() * 2.0f - 1.0f) * 0.02f; }
+    for (int i = 0; i < D * C; i++) { model->alc.write_proj[i] = (ALC_NEXT_RAND() * 2.0f - 1.0f) * 0.01f; }
+    for (int i = 0; i < C * D; i++) { model->alc.slot_to_hidden[i] = (ALC_NEXT_RAND() * 2.0f - 1.0f) * 0.01f; }
+    for (int i = 0; i < C; i++) {
+        model->alc.gate_h[i] = 0.2f;
+        model->alc.gate_a[i] = 0.2f;
+        model->alc.gate_b[i] = 0.0f;
+    }
+    for (int i = 0; i < S * K; i++) {
+        model->alc.slot_keys[i] = (ALC_NEXT_RAND() * 2.0f - 1.0f) * 0.05f;
+    }
+    model->alc.initialized = 1;
+    #undef ALC_NEXT_RAND
+}
+
+static void alc_forward_read_and_fuse(GPT2* model, float* hidden, int B, int T) {
+    int S = model->alc_config.alc_num_slots;
+    int D = model->alc_config.alc_slot_dim;
+    int K = model->alc_config.alc_key_dim;
+    int C = model->config.channels;
+    int BT = B * T;
+    for (int bt = 0; bt < BT; bt++) {
+        float* h = hidden + (size_t)bt * C;
+        float* q = model->alc.query_buffer + (size_t)bt * K;
+        for (int k = 0; k < K; k++) {
+            float sum = 0.0f;
+            const float* wrow = model->alc.query_proj + (size_t)k * C;
+            for (int c = 0; c < C; c++) { sum += wrow[c] * h[c]; }
+            q[k] = sum;
+        }
+        int best_slot = 0;
+        float best_score = -INFINITY;
+        for (int s = 0; s < S; s++) {
+            const float* sk = model->alc.slot_keys + (size_t)s * K;
+            float score = 0.0f;
+            for (int k = 0; k < K; k++) { score += q[k] * sk[k]; }
+            if (score > best_score) { best_score = score; best_slot = s; }
+        }
+        model->alc.selected_slots[bt] = best_slot;
+        float* retrieved = model->alc.retrieved_buffer + (size_t)bt * C;
+        const float* slot = model->alc.slots + (size_t)best_slot * D;
+        for (int c = 0; c < C; c++) {
+            const float* proj = model->alc.slot_to_hidden + (size_t)c * D;
+            float mapped = 0.0f;
+            for (int d = 0; d < D; d++) { mapped += proj[d] * slot[d]; }
+            retrieved[c] = mapped;
+        }
+        if (model->alc_config.alc_fusion_mode == ALC_FUSION_ADDITIVE) {
+            for (int c = 0; c < C; c++) {
+                h[c] += model->alc_config.alc_additive_scale * retrieved[c];
+            }
+        } else {
+            for (int c = 0; c < C; c++) {
+                float gate = alc_sigmoid(model->alc.gate_h[c] * h[c] + model->alc.gate_a[c] * retrieved[c] + model->alc.gate_b[c]);
+                h[c] = gate * h[c] + (1.0f - gate) * retrieved[c];
+            }
+        }
+    }
+}
+
+static void alc_write_update(GPT2* model, float* hidden, int B, int T) {
+    if (model->alc_config.alc_update_rate <= 0.0f) { return; }
+    int D = model->alc_config.alc_slot_dim;
+    int K = model->alc_config.alc_key_dim;
+    int C = model->config.channels;
+    int BT = B * T;
+    float eta = model->alc_config.alc_update_rate;
+    for (int bt = 0; bt < BT; bt++) {
+        int slot_idx = model->alc.selected_slots[bt];
+        float* slot = model->alc.slots + (size_t)slot_idx * D;
+        float* key = model->alc.slot_keys + (size_t)slot_idx * K;
+        const float* q = model->alc.query_buffer + (size_t)bt * K;
+        const float* h = hidden + (size_t)bt * C;
+        for (int d = 0; d < D; d++) {
+            const float* wrow = model->alc.write_proj + (size_t)d * C;
+            float projected = 0.0f;
+            for (int j = 0; j < C; j++) { projected += wrow[j] * h[j]; }
+            slot[d] = (1.0f - eta) * slot[d] + eta * projected;
+        }
+        for (int k = 0; k < K; k++) {
+            key[k] = (1.0f - eta) * key[k] + eta * q[k];
+        }
+    }
+}
 
 void gpt2_build_from_checkpoint(GPT2 *model, const char* checkpoint_path) {
 
@@ -760,6 +938,18 @@ void gpt2_build_from_checkpoint(GPT2 *model, const char* checkpoint_path) {
     model->batch_size = 0;
     model->seq_len = 0;
     model->mean_loss = -1.0f; // -1.0f will designate no loss
+    model->alc_config = (ALCConfig){
+        .use_alc = 0,
+        .alc_num_slots = 64,
+        .alc_slot_dim = C,
+        .alc_key_dim = 64,
+        .alc_update_rate = 0.05f,
+        .alc_fusion_mode = ALC_FUSION_ADDITIVE,
+        .alc_update_mode = ALC_UPDATE_TRAIN_ONLY,
+        .alc_apply_every_n_layers = 1,
+        .alc_additive_scale = 1.0f,
+    };
+    memset(&model->alc, 0, sizeof(ALCState));
 }
 
 void gpt2_forward(GPT2 *model, int* inputs, int* targets, size_t B, size_t T) {
@@ -818,6 +1008,21 @@ void gpt2_forward(GPT2 *model, int* inputs, int* targets, size_t B, size_t T) {
         memcpy(model->targets, targets, B * T * sizeof(int));
     }
 
+    if (model->alc_config.use_alc) {
+        gpt2_init_alc_state(model, B, T);
+        if (!model->alc.logged_enable_message) {
+            printf("[ALC] enabled: slots=%d slot_dim=%d key_dim=%d fusion_mode=%d update_mode=%d apply_every_n_layers=%d update_rate=%.4f\n",
+                   model->alc_config.alc_num_slots,
+                   model->alc_config.alc_slot_dim,
+                   model->alc_config.alc_key_dim,
+                   model->alc_config.alc_fusion_mode,
+                   model->alc_config.alc_update_mode,
+                   model->alc_config.alc_apply_every_n_layers,
+                   model->alc_config.alc_update_rate);
+            model->alc.logged_enable_message = 1;
+        }
+    }
+
     // forward pass
     ParameterTensors params = model->params; // for brevity
     ActivationTensors acts = model->acts;
@@ -870,6 +1075,14 @@ void gpt2_forward(GPT2 *model, int* inputs, int* targets, size_t B, size_t T) {
         gelu_forward(l_fch_gelu, l_fch, B*T*4*C);
         matmul_forward(l_fcproj, l_fch_gelu, l_fcprojw, l_fcprojb, B, T, 4*C, C);
         residual_forward(l_residual3, l_residual2, l_fcproj, B*T*C);
+        if (alc_layer_enabled(model, l)) {
+            alc_forward_read_and_fuse(model, l_residual3, B, T);
+            int do_update = (model->alc_config.alc_update_mode == ALC_UPDATE_ALWAYS)
+                || (model->alc_config.alc_update_mode == ALC_UPDATE_TRAIN_ONLY && targets != NULL);
+            if (do_update) {
+                alc_write_update(model, l_residual3, B, T);
+            }
+        }
     }
     residual = acts.residual3 + (L-1) * B * T * C; // last residual is in residual3
     layernorm_forward(acts.lnf, acts.lnf_mean, acts.lnf_rstd, residual, params.lnfw, params.lnfb, B, T, C);
@@ -1041,6 +1254,17 @@ void gpt2_free(GPT2 *model) {
     free(model->grads_acts_memory);
     free(model->inputs);
     free(model->targets);
+    free(model->alc.query_proj);
+    free(model->alc.write_proj);
+    free(model->alc.slot_to_hidden);
+    free(model->alc.gate_h);
+    free(model->alc.gate_a);
+    free(model->alc.gate_b);
+    free(model->alc.slot_keys);
+    free(model->alc.slots);
+    free(model->alc.query_buffer);
+    free(model->alc.retrieved_buffer);
+    free(model->alc.selected_slots);
 }
 
 #ifndef TESTING
@@ -1072,6 +1296,16 @@ int sample_mult(float* probabilities, int n, float coin) {
     return n - 1; // in case of rounding errors
 }
 
+static int env_get_int(const char* name, int fallback) {
+    const char* value = getenv(name);
+    return value == NULL ? fallback : atoi(value);
+}
+
+static float env_get_float(const char* name, float fallback) {
+    const char* value = getenv(name);
+    return value == NULL ? fallback : atof(value);
+}
+
 // ----------------------------------------------------------------------------
 // main training loop
 int main() {
@@ -1079,6 +1313,17 @@ int main() {
     // build the GPT-2 model from a checkpoint
     GPT2 model;
     gpt2_build_from_checkpoint(&model, "gpt2_124M.bin");
+    ALCConfig alc_cfg = model.alc_config;
+    alc_cfg.use_alc = env_get_int("LLMC_USE_ALC", alc_cfg.use_alc);
+    alc_cfg.alc_num_slots = env_get_int("LLMC_ALC_NUM_SLOTS", alc_cfg.alc_num_slots);
+    alc_cfg.alc_slot_dim = env_get_int("LLMC_ALC_SLOT_DIM", alc_cfg.alc_slot_dim);
+    alc_cfg.alc_key_dim = env_get_int("LLMC_ALC_KEY_DIM", alc_cfg.alc_key_dim);
+    alc_cfg.alc_update_rate = env_get_float("LLMC_ALC_UPDATE_RATE", alc_cfg.alc_update_rate);
+    alc_cfg.alc_fusion_mode = env_get_int("LLMC_ALC_FUSION_MODE", alc_cfg.alc_fusion_mode);
+    alc_cfg.alc_update_mode = env_get_int("LLMC_ALC_UPDATE_MODE", alc_cfg.alc_update_mode);
+    alc_cfg.alc_apply_every_n_layers = env_get_int("LLMC_ALC_APPLY_EVERY_N_LAYERS", alc_cfg.alc_apply_every_n_layers);
+    alc_cfg.alc_additive_scale = env_get_float("LLMC_ALC_ADDITIVE_SCALE", alc_cfg.alc_additive_scale);
+    gpt2_set_alc_config(&model, alc_cfg);
 
     // build the DataLoaders from tokens files. for now use tiny_shakespeare if available, else tiny_stories
     const char* tiny_stories_train = "dev/data/tinystories/TinyStories_train.bin";
