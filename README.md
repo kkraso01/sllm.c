@@ -277,6 +277,17 @@ LLMC_USE_ALC=1 ./train_gpt2
 Additional tuning knobs are exposed through environment variables:
 `LLMC_ALC_NUM_SLOTS`, `LLMC_ALC_SLOT_DIM`, `LLMC_ALC_KEY_DIM`, `LLMC_ALC_UPDATE_RATE`, `LLMC_ALC_FUSION_MODE`, `LLMC_ALC_UPDATE_MODE`, `LLMC_ALC_APPLY_EVERY_N_LAYERS`, and `LLMC_ALC_ADDITIVE_SCALE`.
 
+Persistence/debug knobs:
+- `LLMC_ALC_STATE_IN`, `LLMC_ALC_STATE_OUT` for explicit ALC sidecar load/save
+- `LLMC_ALC_DEBUG=1` for periodic ALC observability summaries
+
+Artifact-independent tiny e2e validation:
+
+```bash
+cc -Ofast -fopenmp dev/test/tiny_alc_e2e.c -lm -lgomp -o dev/test/tiny_alc_e2e
+./dev/test/tiny_alc_e2e
+```
+
 See `docs/adaptive_learning_component.md` for the full architecture/design notes and `docs/alc_change_log.md` for implementation-level change tracking.
 
 ## discussions
