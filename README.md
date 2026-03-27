@@ -253,6 +253,32 @@ Lastly, I will be a lot more sensitive to complexity in the root folder of the p
 - Nim
   - [llm.nim](https://github.com/Vindaar/llm.nim) by @[Vindaar](https://github.com/Vindaar): a Nim port of this project
 
+## experimental: adaptive learning component (ALC) in `train_gpt2.c`
+
+This clone includes an **optional in-model Adaptive Learning Component (ALC)** integrated into the CPU GPT-2 path (`train_gpt2.c`). The component is wired as a native sub-layer after FFN residuals and adds:
+
+- query projection from hidden state into key space
+- slot lookup/retrieval from a persistent adaptive table
+- additive or gated fusion back into hidden state
+- optional EMA write-back updates (train-only or always)
+
+ALC is feature-gated and disabled by default, preserving baseline behavior.
+
+Quick usage:
+
+```bash
+# baseline
+make train_gpt2 && ./train_gpt2
+
+# enable ALC
+LLMC_USE_ALC=1 ./train_gpt2
+```
+
+Additional tuning knobs are exposed through environment variables:
+`LLMC_ALC_NUM_SLOTS`, `LLMC_ALC_SLOT_DIM`, `LLMC_ALC_KEY_DIM`, `LLMC_ALC_UPDATE_RATE`, `LLMC_ALC_FUSION_MODE`, `LLMC_ALC_UPDATE_MODE`, `LLMC_ALC_APPLY_EVERY_N_LAYERS`, and `LLMC_ALC_ADDITIVE_SCALE`.
+
+See `docs/adaptive_learning_component.md` for the full architecture/design notes and `docs/alc_change_log.md` for implementation-level change tracking.
+
 ## discussions
 
 Ways of organizing development:
