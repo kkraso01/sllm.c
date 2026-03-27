@@ -17,6 +17,7 @@ There will be other versions of this code that specialize it and make it fast.
 #include <time.h>
 #include <string.h>
 #include <unistd.h>
+#include <errno.h>
 #ifdef OMP
 #include <omp.h>
 #endif
@@ -572,6 +573,14 @@ typedef struct {
     int* selected_slots; // (B*T)
     int initialized;
     int logged_enable_message;
+    int debug_enabled;
+    int scratch_bt;
+    long forward_calls;
+    long write_calls;
+    long total_writes;
+    long layers_applied;
+    long layer_checks;
+    int* slot_hit_counts;
 } ALCState;
 
 // the parameters of the model
@@ -759,31 +768,85 @@ static int alc_layer_enabled(const GPT2* model, int layer) {
     return ((layer + 1) % every) == 0;
 }
 
+static const char* alc_fusion_mode_name(int mode) {
+    switch (mode) {
+        case ALC_FUSION_ADDITIVE: return "additive";
+        case ALC_FUSION_GATED: return "gated";
+        default: return "unknown";
+    }
+}
+
+static const char* alc_update_mode_name(int mode) {
+    switch (mode) {
+        case ALC_UPDATE_OFF: return "off";
+        case ALC_UPDATE_TRAIN_ONLY: return "train_only";
+        case ALC_UPDATE_ALWAYS: return "always";
+        default: return "unknown";
+    }
+}
+
+typedef struct {
+    int magic;
+    int version;
+    int channels;
+    int num_slots;
+    int slot_dim;
+    int key_dim;
+    int fusion_mode;
+    int update_mode;
+    int reserved[8];
+} ALCCheckpointHeader;
+
 void gpt2_set_alc_config(GPT2 *model, ALCConfig config) {
     model->alc_config = config;
 }
 
 static void gpt2_validate_alc_config(const GPT2* model) {
     if (!model->alc_config.use_alc) { return; }
-    int C = model->config.channels;
-    assert(model->alc_config.alc_num_slots > 0);
-    assert(model->alc_config.alc_slot_dim > 0);
-    assert(model->alc_config.alc_key_dim > 0);
-    assert(model->alc_config.alc_update_rate >= 0.0f && model->alc_config.alc_update_rate <= 1.0f);
-    assert(model->alc_config.alc_apply_every_n_layers > 0);
-    assert(model->alc_config.alc_fusion_mode == ALC_FUSION_ADDITIVE || model->alc_config.alc_fusion_mode == ALC_FUSION_GATED);
-    assert(model->alc_config.alc_update_mode >= ALC_UPDATE_OFF && model->alc_config.alc_update_mode <= ALC_UPDATE_ALWAYS);
-    assert(C > 0);
+    const ALCConfig* cfg = &model->alc_config;
+    if (cfg->alc_num_slots <= 0) { fprintf(stderr, "[ALC] invalid config: alc_num_slots=%d (must be >0)\n", cfg->alc_num_slots); exit(1); }
+    if (cfg->alc_slot_dim <= 0) { fprintf(stderr, "[ALC] invalid config: alc_slot_dim=%d (must be >0)\n", cfg->alc_slot_dim); exit(1); }
+    if (cfg->alc_key_dim <= 0) { fprintf(stderr, "[ALC] invalid config: alc_key_dim=%d (must be >0)\n", cfg->alc_key_dim); exit(1); }
+    if (cfg->alc_update_rate < 0.0f || cfg->alc_update_rate > 1.0f) {
+        fprintf(stderr, "[ALC] invalid config: alc_update_rate=%.6f (must be in [0,1])\n", cfg->alc_update_rate);
+        exit(1);
+    }
+    if (cfg->alc_apply_every_n_layers <= 0) {
+        fprintf(stderr, "[ALC] invalid config: alc_apply_every_n_layers=%d (must be >0)\n", cfg->alc_apply_every_n_layers);
+        exit(1);
+    }
+    if (cfg->alc_fusion_mode != ALC_FUSION_ADDITIVE && cfg->alc_fusion_mode != ALC_FUSION_GATED) {
+        fprintf(stderr, "[ALC] invalid config: alc_fusion_mode=%d (valid: 0 additive, 1 gated)\n", cfg->alc_fusion_mode);
+        exit(1);
+    }
+    if (cfg->alc_update_mode < ALC_UPDATE_OFF || cfg->alc_update_mode > ALC_UPDATE_ALWAYS) {
+        fprintf(stderr, "[ALC] invalid config: alc_update_mode=%d (valid: 0 off, 1 train_only, 2 always)\n", cfg->alc_update_mode);
+        exit(1);
+    }
+    if (model->config.channels <= 0) { fprintf(stderr, "[ALC] invalid model channels=%d\n", model->config.channels); exit(1); }
 }
 
 static void gpt2_init_alc_state(GPT2* model, int B, int T) {
-    if (!model->alc_config.use_alc || model->alc.initialized) { return; }
+    if (!model->alc_config.use_alc) { return; }
     gpt2_validate_alc_config(model);
     int S = model->alc_config.alc_num_slots;
     int D = model->alc_config.alc_slot_dim;
     int K = model->alc_config.alc_key_dim;
     int C = model->config.channels;
     int BT = B * T;
+    if (BT <= 0) { fprintf(stderr, "[ALC] invalid runtime B*T=%d\n", BT); exit(1); }
+    if (model->alc.initialized) {
+        if (model->alc.scratch_bt != BT) {
+            free(model->alc.query_buffer);
+            free(model->alc.retrieved_buffer);
+            free(model->alc.selected_slots);
+            model->alc.query_buffer = (float*)mallocCheck((size_t)BT * K * sizeof(float));
+            model->alc.retrieved_buffer = (float*)mallocCheck((size_t)BT * C * sizeof(float));
+            model->alc.selected_slots = (int*)mallocCheck((size_t)BT * sizeof(int));
+            model->alc.scratch_bt = BT;
+        }
+        return;
+    }
     uint64_t seed = 0x9E3779B97F4A7C15ull;
     #define ALC_NEXT_RAND() (seed ^= seed << 7, seed ^= seed >> 9, ((seed & 0xFFFFFF) / (float)0x1000000))
     model->alc.query_proj = (float*)mallocCheck((size_t)K * C * sizeof(float));
@@ -794,6 +857,7 @@ static void gpt2_init_alc_state(GPT2* model, int B, int T) {
     model->alc.gate_b = (float*)mallocCheck((size_t)C * sizeof(float));
     model->alc.slot_keys = (float*)mallocCheck((size_t)S * K * sizeof(float));
     model->alc.slots = (float*)calloc((size_t)S * D, sizeof(float));
+    model->alc.slot_hit_counts = (int*)calloc((size_t)S, sizeof(int));
     model->alc.query_buffer = (float*)mallocCheck((size_t)BT * K * sizeof(float));
     model->alc.retrieved_buffer = (float*)mallocCheck((size_t)BT * C * sizeof(float));
     model->alc.selected_slots = (int*)mallocCheck((size_t)BT * sizeof(int));
@@ -809,6 +873,7 @@ static void gpt2_init_alc_state(GPT2* model, int B, int T) {
         model->alc.slot_keys[i] = (ALC_NEXT_RAND() * 2.0f - 1.0f) * 0.05f;
     }
     model->alc.initialized = 1;
+    model->alc.scratch_bt = BT;
     #undef ALC_NEXT_RAND
 }
 
@@ -818,6 +883,7 @@ static void alc_forward_read_and_fuse(GPT2* model, float* hidden, int B, int T) 
     int K = model->alc_config.alc_key_dim;
     int C = model->config.channels;
     int BT = B * T;
+    model->alc.forward_calls++;
     for (int bt = 0; bt < BT; bt++) {
         float* h = hidden + (size_t)bt * C;
         float* q = model->alc.query_buffer + (size_t)bt * K;
@@ -836,6 +902,7 @@ static void alc_forward_read_and_fuse(GPT2* model, float* hidden, int B, int T) 
             if (score > best_score) { best_score = score; best_slot = s; }
         }
         model->alc.selected_slots[bt] = best_slot;
+        if (model->alc.slot_hit_counts != NULL) { model->alc.slot_hit_counts[best_slot]++; }
         float* retrieved = model->alc.retrieved_buffer + (size_t)bt * C;
         const float* slot = model->alc.slots + (size_t)best_slot * D;
         for (int c = 0; c < C; c++) {
@@ -864,6 +931,8 @@ static void alc_write_update(GPT2* model, float* hidden, int B, int T) {
     int C = model->config.channels;
     int BT = B * T;
     float eta = model->alc_config.alc_update_rate;
+    model->alc.write_calls++;
+    model->alc.total_writes += BT;
     for (int bt = 0; bt < BT; bt++) {
         int slot_idx = model->alc.selected_slots[bt];
         float* slot = model->alc.slots + (size_t)slot_idx * D;
@@ -880,6 +949,92 @@ static void alc_write_update(GPT2* model, float* hidden, int B, int T) {
             key[k] = (1.0f - eta) * key[k] + eta * q[k];
         }
     }
+}
+
+int gpt2_save_alc_state(const GPT2* model, const char* path) {
+    if (!model->alc_config.use_alc) {
+        fprintf(stderr, "[ALC] refusing to save state while ALC is disabled.\n");
+        return 0;
+    }
+    if (!model->alc.initialized) {
+        fprintf(stderr, "[ALC] refusing to save state before ALC is initialized.\n");
+        return 0;
+    }
+    FILE* f = fopen(path, "wb");
+    if (f == NULL) {
+        fprintf(stderr, "[ALC] failed to open save path '%s': %s\n", path, strerror(errno));
+        return 0;
+    }
+    ALCCheckpointHeader h = {
+        .magic = 0x414C4331, // ALC1
+        .version = 1,
+        .channels = model->config.channels,
+        .num_slots = model->alc_config.alc_num_slots,
+        .slot_dim = model->alc_config.alc_slot_dim,
+        .key_dim = model->alc_config.alc_key_dim,
+        .fusion_mode = model->alc_config.alc_fusion_mode,
+        .update_mode = model->alc_config.alc_update_mode,
+    };
+    fwriteCheck(&h, sizeof(ALCCheckpointHeader), 1, f);
+    int C = model->config.channels;
+    int S = model->alc_config.alc_num_slots;
+    int D = model->alc_config.alc_slot_dim;
+    int K = model->alc_config.alc_key_dim;
+    fwriteCheck(model->alc.query_proj, sizeof(float), (size_t)K * C, f);
+    fwriteCheck(model->alc.write_proj, sizeof(float), (size_t)D * C, f);
+    fwriteCheck(model->alc.slot_to_hidden, sizeof(float), (size_t)C * D, f);
+    fwriteCheck(model->alc.gate_h, sizeof(float), (size_t)C, f);
+    fwriteCheck(model->alc.gate_a, sizeof(float), (size_t)C, f);
+    fwriteCheck(model->alc.gate_b, sizeof(float), (size_t)C, f);
+    fwriteCheck(model->alc.slot_keys, sizeof(float), (size_t)S * K, f);
+    fwriteCheck(model->alc.slots, sizeof(float), (size_t)S * D, f);
+    fcloseCheck(f);
+    return 1;
+}
+
+int gpt2_load_alc_state(GPT2* model, const char* path, int B, int T) {
+    if (!model->alc_config.use_alc) {
+        fprintf(stderr, "[ALC] refusing to load state while ALC is disabled.\n");
+        return 0;
+    }
+    gpt2_init_alc_state(model, B, T);
+    FILE* f = fopen(path, "rb");
+    if (f == NULL) {
+        fprintf(stderr, "[ALC] failed to open state path '%s': %s\n", path, strerror(errno));
+        return 0;
+    }
+    ALCCheckpointHeader h;
+    freadCheck(&h, sizeof(ALCCheckpointHeader), 1, f);
+    if (h.magic != 0x414C4331 || h.version != 1) {
+        fprintf(stderr, "[ALC] incompatible state file '%s': bad magic/version (%d/%d)\n", path, h.magic, h.version);
+        fcloseCheck(f);
+        exit(1);
+    }
+    if (h.channels != model->config.channels || h.num_slots != model->alc_config.alc_num_slots ||
+        h.slot_dim != model->alc_config.alc_slot_dim || h.key_dim != model->alc_config.alc_key_dim ||
+        h.fusion_mode != model->alc_config.alc_fusion_mode || h.update_mode != model->alc_config.alc_update_mode) {
+        fprintf(stderr,
+                "[ALC] state mismatch for '%s': file(C=%d,S=%d,D=%d,K=%d,fusion=%d,update=%d) vs runtime(C=%d,S=%d,D=%d,K=%d,fusion=%d,update=%d)\n",
+                path, h.channels, h.num_slots, h.slot_dim, h.key_dim, h.fusion_mode, h.update_mode,
+                model->config.channels, model->alc_config.alc_num_slots, model->alc_config.alc_slot_dim,
+                model->alc_config.alc_key_dim, model->alc_config.alc_fusion_mode, model->alc_config.alc_update_mode);
+        fcloseCheck(f);
+        exit(1);
+    }
+    int C = model->config.channels;
+    int S = model->alc_config.alc_num_slots;
+    int D = model->alc_config.alc_slot_dim;
+    int K = model->alc_config.alc_key_dim;
+    freadCheck(model->alc.query_proj, sizeof(float), (size_t)K * C, f);
+    freadCheck(model->alc.write_proj, sizeof(float), (size_t)D * C, f);
+    freadCheck(model->alc.slot_to_hidden, sizeof(float), (size_t)C * D, f);
+    freadCheck(model->alc.gate_h, sizeof(float), (size_t)C, f);
+    freadCheck(model->alc.gate_a, sizeof(float), (size_t)C, f);
+    freadCheck(model->alc.gate_b, sizeof(float), (size_t)C, f);
+    freadCheck(model->alc.slot_keys, sizeof(float), (size_t)S * K, f);
+    freadCheck(model->alc.slots, sizeof(float), (size_t)S * D, f);
+    fcloseCheck(f);
+    return 1;
 }
 
 void gpt2_build_from_checkpoint(GPT2 *model, const char* checkpoint_path) {
@@ -952,6 +1107,45 @@ void gpt2_build_from_checkpoint(GPT2 *model, const char* checkpoint_path) {
     memset(&model->alc, 0, sizeof(ALCState));
 }
 
+void gpt2_build_from_synthetic(GPT2 *model, GPT2Config config) {
+    model->config = config;
+    fill_in_parameter_sizes(model->param_sizes, model->config);
+    size_t num_parameters = 0;
+    for (size_t i = 0; i < NUM_PARAMETER_TENSORS; i++) { num_parameters += model->param_sizes[i]; }
+    model->num_parameters = num_parameters;
+    model->params_memory = malloc_and_point_parameters(&model->params, model->param_sizes);
+    uint64_t seed = 0xD1B54A32D192ED03ull;
+    for (size_t i = 0; i < num_parameters; i++) {
+        seed ^= seed << 7;
+        seed ^= seed >> 9;
+        float u = (seed & 0xFFFFFF) / (float)0x1000000;
+        model->params_memory[i] = (u * 2.0f - 1.0f) * 0.02f;
+    }
+    model->acts_memory = NULL;
+    model->grads_memory = NULL;
+    model->m_memory = NULL;
+    model->v_memory = NULL;
+    model->grads_acts_memory = NULL;
+    model->inputs = NULL;
+    model->targets = NULL;
+    model->batch_size = 0;
+    model->seq_len = 0;
+    model->mean_loss = -1.0f;
+    int C = model->config.channels;
+    model->alc_config = (ALCConfig){
+        .use_alc = 0,
+        .alc_num_slots = 32,
+        .alc_slot_dim = C,
+        .alc_key_dim = C < 32 ? C : 32,
+        .alc_update_rate = 0.05f,
+        .alc_fusion_mode = ALC_FUSION_ADDITIVE,
+        .alc_update_mode = ALC_UPDATE_TRAIN_ONLY,
+        .alc_apply_every_n_layers = 1,
+        .alc_additive_scale = 1.0f,
+    };
+    memset(&model->alc, 0, sizeof(ALCState));
+}
+
 void gpt2_forward(GPT2 *model, int* inputs, int* targets, size_t B, size_t T) {
     // targets are optional and could be NULL
 
@@ -1011,12 +1205,12 @@ void gpt2_forward(GPT2 *model, int* inputs, int* targets, size_t B, size_t T) {
     if (model->alc_config.use_alc) {
         gpt2_init_alc_state(model, B, T);
         if (!model->alc.logged_enable_message) {
-            printf("[ALC] enabled: slots=%d slot_dim=%d key_dim=%d fusion_mode=%d update_mode=%d apply_every_n_layers=%d update_rate=%.4f\n",
+            printf("[ALC] enabled: slots=%d slot_dim=%d key_dim=%d fusion_mode=%s update_mode=%s apply_every_n_layers=%d update_rate=%.4f\n",
                    model->alc_config.alc_num_slots,
                    model->alc_config.alc_slot_dim,
                    model->alc_config.alc_key_dim,
-                   model->alc_config.alc_fusion_mode,
-                   model->alc_config.alc_update_mode,
+                   alc_fusion_mode_name(model->alc_config.alc_fusion_mode),
+                   alc_update_mode_name(model->alc_config.alc_update_mode),
                    model->alc_config.alc_apply_every_n_layers,
                    model->alc_config.alc_update_rate);
             model->alc.logged_enable_message = 1;
@@ -1075,7 +1269,12 @@ void gpt2_forward(GPT2 *model, int* inputs, int* targets, size_t B, size_t T) {
         gelu_forward(l_fch_gelu, l_fch, B*T*4*C);
         matmul_forward(l_fcproj, l_fch_gelu, l_fcprojw, l_fcprojb, B, T, 4*C, C);
         residual_forward(l_residual3, l_residual2, l_fcproj, B*T*C);
-        if (alc_layer_enabled(model, l)) {
+        // post-FFN extension region ordering (future intent):
+        // attention -> FFN/MoE -> Engram(optional) -> ALC(optional) -> residual continuation
+        int alc_apply = alc_layer_enabled(model, l);
+        if (model->alc_config.use_alc) { model->alc.layer_checks++; }
+        if (alc_apply) {
+            model->alc.layers_applied++;
             alc_forward_read_and_fuse(model, l_residual3, B, T);
             int do_update = (model->alc_config.alc_update_mode == ALC_UPDATE_ALWAYS)
                 || (model->alc_config.alc_update_mode == ALC_UPDATE_TRAIN_ONLY && targets != NULL);
@@ -1083,6 +1282,21 @@ void gpt2_forward(GPT2 *model, int* inputs, int* targets, size_t B, size_t T) {
                 alc_write_update(model, l_residual3, B, T);
             }
         }
+    }
+    if (model->alc_config.use_alc && model->alc.debug_enabled && model->alc.forward_calls % 10 == 0) {
+        int S = model->alc_config.alc_num_slots;
+        int top_slot = 0;
+        int top_hits = 0;
+        for (int s = 0; s < S; s++) {
+            int hits = model->alc.slot_hit_counts == NULL ? 0 : model->alc.slot_hit_counts[s];
+            if (hits > top_hits) { top_hits = hits; top_slot = s; }
+        }
+        printf("[ALC][debug] fwd=%ld layers_applied=%ld/%ld writes=%ld tokens_written=%ld fusion=%s update=%s top_slot=%d hits=%d\n",
+               model->alc.forward_calls, model->alc.layers_applied, model->alc.layer_checks,
+               model->alc.write_calls, model->alc.total_writes,
+               alc_fusion_mode_name(model->alc_config.alc_fusion_mode),
+               alc_update_mode_name(model->alc_config.alc_update_mode),
+               top_slot, top_hits);
     }
     residual = acts.residual3 + (L-1) * B * T * C; // last residual is in residual3
     layernorm_forward(acts.lnf, acts.lnf_mean, acts.lnf_rstd, residual, params.lnfw, params.lnfb, B, T, C);
@@ -1265,6 +1479,7 @@ void gpt2_free(GPT2 *model) {
     free(model->alc.query_buffer);
     free(model->alc.retrieved_buffer);
     free(model->alc.selected_slots);
+    free(model->alc.slot_hit_counts);
 }
 
 #ifndef TESTING
@@ -1306,13 +1521,38 @@ static float env_get_float(const char* name, float fallback) {
     return value == NULL ? fallback : atof(value);
 }
 
+static const char* env_get_str(const char* name, const char* fallback) {
+    const char* value = getenv(name);
+    return value == NULL ? fallback : value;
+}
+
 // ----------------------------------------------------------------------------
 // main training loop
 int main() {
 
-    // build the GPT-2 model from a checkpoint
+    // build the GPT-2 model (checkpoint by default, synthetic via env opt-in)
     GPT2 model;
-    gpt2_build_from_checkpoint(&model, "gpt2_124M.bin");
+    int use_synth = env_get_int("LLMC_USE_SYNTHETIC_MODEL", 0);
+    if (use_synth) {
+        GPT2Config synth_cfg = {
+            .max_seq_len = env_get_int("LLMC_SYNTH_MAX_SEQ_LEN", 16),
+            .vocab_size = env_get_int("LLMC_SYNTH_VOCAB_SIZE", 128),
+            .padded_vocab_size = env_get_int("LLMC_SYNTH_PADDED_VOCAB_SIZE", 128),
+            .num_layers = env_get_int("LLMC_SYNTH_NUM_LAYERS", 2),
+            .num_heads = env_get_int("LLMC_SYNTH_NUM_HEADS", 2),
+            .channels = env_get_int("LLMC_SYNTH_CHANNELS", 32),
+        };
+        if (synth_cfg.padded_vocab_size < synth_cfg.vocab_size) {
+            fprintf(stderr, "LLMC_SYNTH_PADDED_VOCAB_SIZE (%d) must be >= LLMC_SYNTH_VOCAB_SIZE (%d)\n",
+                    synth_cfg.padded_vocab_size, synth_cfg.vocab_size);
+            exit(1);
+        }
+        gpt2_build_from_synthetic(&model, synth_cfg);
+        printf("[GPT-2 synthetic] tiny validation model initialized\n");
+    } else {
+        const char* checkpoint_path = env_get_str("LLMC_CHECKPOINT_PATH", "gpt2_124M.bin");
+        gpt2_build_from_checkpoint(&model, checkpoint_path);
+    }
     ALCConfig alc_cfg = model.alc_config;
     alc_cfg.use_alc = env_get_int("LLMC_USE_ALC", alc_cfg.use_alc);
     alc_cfg.alc_num_slots = env_get_int("LLMC_ALC_NUM_SLOTS", alc_cfg.alc_num_slots);
@@ -1324,6 +1564,7 @@ int main() {
     alc_cfg.alc_apply_every_n_layers = env_get_int("LLMC_ALC_APPLY_EVERY_N_LAYERS", alc_cfg.alc_apply_every_n_layers);
     alc_cfg.alc_additive_scale = env_get_float("LLMC_ALC_ADDITIVE_SCALE", alc_cfg.alc_additive_scale);
     gpt2_set_alc_config(&model, alc_cfg);
+    model.alc.debug_enabled = env_get_int("LLMC_ALC_DEBUG", 0);
 
     // build the DataLoaders from tokens files. for now use tiny_shakespeare if available, else tiny_stories
     const char* tiny_stories_train = "dev/data/tinystories/TinyStories_train.bin";
@@ -1334,12 +1575,28 @@ int main() {
     const char* val_tokens = access(tiny_shakespeare_val, F_OK) != -1 ? tiny_shakespeare_val : tiny_stories_val;
     int B = 4; // batch size 4 (i.e. 4 independent token sequences will be trained on)
     int T = 64; // sequence length 64 (i.e. each sequence is 64 tokens long). must be <= maxT, which is 1024 for GPT-2
+    if (use_synth) {
+        B = env_get_int("LLMC_SYNTH_BATCH_SIZE", 2);
+        T = env_get_int("LLMC_SYNTH_SEQ_LEN", 8);
+        if (T > model.config.max_seq_len) {
+            fprintf(stderr, "LLMC_SYNTH_SEQ_LEN (%d) must be <= max_seq_len (%d)\n", T, model.config.max_seq_len);
+            exit(1);
+        }
+    }
     DataLoader train_loader, val_loader;
     dataloader_init(&train_loader, train_tokens, B, T, 0, 1, 1);
     dataloader_init(&val_loader, val_tokens, B, T, 0, 1, 0);
     printf("train dataset num_batches: %zu\n", train_loader.num_tokens / (B*T));
     printf("val dataset num_batches: %zu\n", val_loader.num_tokens / (B*T));
     int val_num_batches = 5;
+    if (use_synth) { val_num_batches = 1; }
+
+    const char* alc_state_in = env_get_str("LLMC_ALC_STATE_IN", "");
+    const char* alc_state_out = env_get_str("LLMC_ALC_STATE_OUT", "");
+    if (model.alc_config.use_alc && strlen(alc_state_in) > 0) {
+        int loaded = gpt2_load_alc_state(&model, alc_state_in, B, T);
+        if (loaded) { printf("[ALC] loaded state: %s\n", alc_state_in); }
+    }
 
     // build the Tokenizer
     Tokenizer tokenizer;
@@ -1420,6 +1677,13 @@ int main() {
     dataloader_free(&train_loader);
     dataloader_free(&val_loader);
     tokenizer_free(&tokenizer);
+    if (model.alc_config.use_alc && strlen(alc_state_out) > 0) {
+        if (gpt2_save_alc_state(&model, alc_state_out)) {
+            printf("[ALC] saved state: %s\n", alc_state_out);
+        } else {
+            fprintf(stderr, "[ALC] failed to save state: %s\n", alc_state_out);
+        }
+    }
     gpt2_free(&model);
     free(gen_tokens);
     return 0;
