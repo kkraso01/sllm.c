@@ -264,6 +264,11 @@ This clone includes an **optional in-model Adaptive Learning Component (ALC)** i
 
 ALC is feature-gated and disabled by default, preserving baseline behavior.
 
+Training behavior in current CPU path is intentionally hybrid:
+- **Gradient-trained:** `slot_to_hidden`, and (`gate_h`, `gate_a`, `gate_b`) in gated mode.
+- **EMA/state-updated memory:** `slots`, `slot_keys`.
+- **Not backprop-trained in this pass:** `query_proj`, `write_proj` (hard routing/write-state coupling remains explicit).
+
 Quick usage:
 
 ```bash
@@ -281,12 +286,17 @@ Persistence/debug knobs:
 - `LLMC_ALC_STATE_IN`, `LLMC_ALC_STATE_OUT` for explicit ALC sidecar load/save
 - `LLMC_ALC_DEBUG=1` for periodic ALC observability summaries
 
+Complete ALC env var list:
+`LLMC_USE_ALC`, `LLMC_ALC_NUM_SLOTS`, `LLMC_ALC_SLOT_DIM`, `LLMC_ALC_KEY_DIM`, `LLMC_ALC_UPDATE_RATE`, `LLMC_ALC_FUSION_MODE`, `LLMC_ALC_UPDATE_MODE`, `LLMC_ALC_APPLY_EVERY_N_LAYERS`, `LLMC_ALC_ADDITIVE_SCALE`, `LLMC_ALC_STATE_IN`, `LLMC_ALC_STATE_OUT`, `LLMC_ALC_DEBUG`.
+
 Artifact-independent tiny e2e validation:
 
 ```bash
 cc -Ofast -fopenmp dev/test/tiny_alc_e2e.c -lm -lgomp -o dev/test/tiny_alc_e2e
 ./dev/test/tiny_alc_e2e
 ```
+
+The tiny test validates ALC-on/off behavioral divergence, ALC write-state effects, gradient update plumbing for ALC fusion tensors, and persistence round-trip correctness.
 
 See `docs/adaptive_learning_component.md` for the full architecture/design notes and `docs/alc_change_log.md` for implementation-level change tracking.
 

@@ -581,6 +581,24 @@ typedef struct {
     long layers_applied;
     long layer_checks;
     int* slot_hit_counts;
+    // per-layer forward traces for ALC backward (only populated when ALC active)
+    float* hidden_pre_layers; // (L, B*T, C)
+    float* retrieved_layers; // (L, B*T, C)
+    int* selected_slots_layers; // (L, B*T)
+    int trace_bt;
+    // gradients + optimizer state for trainable differentiable ALC tensors
+    float* d_slot_to_hidden; // (C, D)
+    float* d_gate_h; // (C)
+    float* d_gate_a; // (C)
+    float* d_gate_b; // (C)
+    float* m_slot_to_hidden; // Adam first moment
+    float* v_slot_to_hidden; // Adam second moment
+    float* m_gate_h;
+    float* v_gate_h;
+    float* m_gate_a;
+    float* v_gate_a;
+    float* m_gate_b;
+    float* v_gate_b;
 } ALCState;
 
 // the parameters of the model
@@ -786,15 +804,17 @@ static const char* alc_update_mode_name(int mode) {
 }
 
 typedef struct {
-    int magic;
-    int version;
-    int channels;
-    int num_slots;
-    int slot_dim;
-    int key_dim;
-    int fusion_mode;
-    int update_mode;
-    int reserved[8];
+    uint32_t magic;
+    uint32_t version;
+    uint32_t endian_marker;
+    uint32_t header_bytes;
+    uint32_t channels;
+    uint32_t num_slots;
+    uint32_t slot_dim;
+    uint32_t key_dim;
+    uint32_t fusion_mode;
+    uint32_t update_mode;
+    uint32_t reserved[6];
 } ALCCheckpointHeader;
 
 void gpt2_set_alc_config(GPT2 *model, ALCConfig config) {
@@ -877,15 +897,64 @@ static void gpt2_init_alc_state(GPT2* model, int B, int T) {
     #undef ALC_NEXT_RAND
 }
 
-static void alc_forward_read_and_fuse(GPT2* model, float* hidden, int B, int T) {
+static void alc_ensure_layer_traces(GPT2* model, int B, int T) {
+    if (!model->alc_config.use_alc || !model->alc.initialized) { return; }
+    int BT = B * T;
+    int L = model->config.num_layers;
+    int C = model->config.channels;
+    if (model->alc.trace_bt == BT && model->alc.hidden_pre_layers != NULL &&
+        model->alc.retrieved_layers != NULL && model->alc.selected_slots_layers != NULL) {
+        return;
+    }
+    free(model->alc.hidden_pre_layers);
+    free(model->alc.retrieved_layers);
+    free(model->alc.selected_slots_layers);
+    model->alc.hidden_pre_layers = (float*)mallocCheck((size_t)L * BT * C * sizeof(float));
+    model->alc.retrieved_layers = (float*)mallocCheck((size_t)L * BT * C * sizeof(float));
+    model->alc.selected_slots_layers = (int*)mallocCheck((size_t)L * BT * sizeof(int));
+    model->alc.trace_bt = BT;
+}
+
+static void alc_zero_param_grads(ALCState* alc, int C, int D) {
+    if (alc->d_slot_to_hidden != NULL) { memset(alc->d_slot_to_hidden, 0, (size_t)C * D * sizeof(float)); }
+    if (alc->d_gate_h != NULL) { memset(alc->d_gate_h, 0, (size_t)C * sizeof(float)); }
+    if (alc->d_gate_a != NULL) { memset(alc->d_gate_a, 0, (size_t)C * sizeof(float)); }
+    if (alc->d_gate_b != NULL) { memset(alc->d_gate_b, 0, (size_t)C * sizeof(float)); }
+}
+
+static void alc_ensure_grad_buffers(GPT2* model) {
+    if (!model->alc_config.use_alc || !model->alc.initialized) { return; }
+    int C = model->config.channels;
+    int D = model->alc_config.alc_slot_dim;
+    if (model->alc.d_slot_to_hidden == NULL) {
+        model->alc.d_slot_to_hidden = (float*)calloc((size_t)C * D, sizeof(float));
+        model->alc.m_slot_to_hidden = (float*)calloc((size_t)C * D, sizeof(float));
+        model->alc.v_slot_to_hidden = (float*)calloc((size_t)C * D, sizeof(float));
+        model->alc.d_gate_h = (float*)calloc((size_t)C, sizeof(float));
+        model->alc.d_gate_a = (float*)calloc((size_t)C, sizeof(float));
+        model->alc.d_gate_b = (float*)calloc((size_t)C, sizeof(float));
+        model->alc.m_gate_h = (float*)calloc((size_t)C, sizeof(float));
+        model->alc.v_gate_h = (float*)calloc((size_t)C, sizeof(float));
+        model->alc.m_gate_a = (float*)calloc((size_t)C, sizeof(float));
+        model->alc.v_gate_a = (float*)calloc((size_t)C, sizeof(float));
+        model->alc.m_gate_b = (float*)calloc((size_t)C, sizeof(float));
+        model->alc.v_gate_b = (float*)calloc((size_t)C, sizeof(float));
+    }
+}
+
+static void alc_forward_read_and_fuse(GPT2* model, float* hidden, int B, int T, int layer) {
     int S = model->alc_config.alc_num_slots;
     int D = model->alc_config.alc_slot_dim;
     int K = model->alc_config.alc_key_dim;
     int C = model->config.channels;
     int BT = B * T;
     model->alc.forward_calls++;
+    float* layer_hidden_pre = model->alc.hidden_pre_layers + (size_t)layer * BT * C;
+    float* layer_retrieved = model->alc.retrieved_layers + (size_t)layer * BT * C;
+    int* layer_slots = model->alc.selected_slots_layers + (size_t)layer * BT;
     for (int bt = 0; bt < BT; bt++) {
         float* h = hidden + (size_t)bt * C;
+        memcpy(layer_hidden_pre + (size_t)bt * C, h, (size_t)C * sizeof(float));
         float* q = model->alc.query_buffer + (size_t)bt * K;
         for (int k = 0; k < K; k++) {
             float sum = 0.0f;
@@ -902,6 +971,7 @@ static void alc_forward_read_and_fuse(GPT2* model, float* hidden, int B, int T) 
             if (score > best_score) { best_score = score; best_slot = s; }
         }
         model->alc.selected_slots[bt] = best_slot;
+        layer_slots[bt] = best_slot;
         if (model->alc.slot_hit_counts != NULL) { model->alc.slot_hit_counts[best_slot]++; }
         float* retrieved = model->alc.retrieved_buffer + (size_t)bt * C;
         const float* slot = model->alc.slots + (size_t)best_slot * D;
@@ -911,6 +981,7 @@ static void alc_forward_read_and_fuse(GPT2* model, float* hidden, int B, int T) 
             for (int d = 0; d < D; d++) { mapped += proj[d] * slot[d]; }
             retrieved[c] = mapped;
         }
+        memcpy(layer_retrieved + (size_t)bt * C, retrieved, (size_t)C * sizeof(float));
         if (model->alc_config.alc_fusion_mode == ALC_FUSION_ADDITIVE) {
             for (int c = 0; c < C; c++) {
                 h[c] += model->alc_config.alc_additive_scale * retrieved[c];
@@ -951,6 +1022,61 @@ static void alc_write_update(GPT2* model, float* hidden, int B, int T) {
     }
 }
 
+static void alc_backward_fuse_and_accumulate(GPT2* model, int layer, float* d_hidden_out, int B, int T) {
+    if (!model->alc_config.use_alc || !alc_layer_enabled(model, layer)) { return; }
+    int BT = B * T;
+    int C = model->config.channels;
+    int D = model->alc_config.alc_slot_dim;
+    const float* layer_hidden_pre = model->alc.hidden_pre_layers + (size_t)layer * BT * C;
+    const float* layer_retrieved = model->alc.retrieved_layers + (size_t)layer * BT * C;
+    const int* layer_slots = model->alc.selected_slots_layers + (size_t)layer * BT;
+    for (int bt = 0; bt < BT; bt++) {
+        float* d_h = d_hidden_out + (size_t)bt * C;
+        const float* h_pre = layer_hidden_pre + (size_t)bt * C;
+        const float* retrieved = layer_retrieved + (size_t)bt * C;
+        int slot_idx = layer_slots[bt];
+        const float* slot = model->alc.slots + (size_t)slot_idx * D;
+        for (int c = 0; c < C; c++) {
+            float d_out = d_h[c];
+            float d_retrieved = model->alc_config.alc_additive_scale * d_out;
+            if (model->alc_config.alc_fusion_mode == ALC_FUSION_GATED) {
+                float gh = model->alc.gate_h[c];
+                float ga = model->alc.gate_a[c];
+                float z = gh * h_pre[c] + ga * retrieved[c] + model->alc.gate_b[c];
+                float g = alc_sigmoid(z);
+                float d_g = d_out * (h_pre[c] - retrieved[c]);
+                float d_z = d_g * g * (1.0f - g);
+                model->alc.d_gate_h[c] += d_z * h_pre[c];
+                model->alc.d_gate_a[c] += d_z * retrieved[c];
+                model->alc.d_gate_b[c] += d_z;
+                d_retrieved = d_out * (1.0f - g) + d_z * ga;
+                d_h[c] = d_out * g + d_z * gh;
+            }
+            float* d_proj_row = model->alc.d_slot_to_hidden + (size_t)c * D;
+            for (int d = 0; d < D; d++) {
+                d_proj_row[d] += d_retrieved * slot[d];
+            }
+        }
+    }
+}
+
+static void alc_adamw_update(float* p, float* g, float* m, float* v, size_t n,
+                             float learning_rate, float beta1, float beta2, float eps, float weight_decay, int t) {
+    float beta1_correction = 1.0f - powf(beta1, t);
+    float beta2_correction = 1.0f - powf(beta2, t);
+    for (size_t i = 0; i < n; i++) {
+        float grad = g[i];
+        float param = p[i];
+        float m_new = beta1 * m[i] + (1.0f - beta1) * grad;
+        float v_new = beta2 * v[i] + (1.0f - beta2) * grad * grad;
+        float m_hat = m_new / beta1_correction;
+        float v_hat = v_new / beta2_correction;
+        m[i] = m_new;
+        v[i] = v_new;
+        p[i] -= learning_rate * (m_hat / (sqrtf(v_hat) + eps) + weight_decay * param);
+    }
+}
+
 int gpt2_save_alc_state(const GPT2* model, const char* path) {
     if (!model->alc_config.use_alc) {
         fprintf(stderr, "[ALC] refusing to save state while ALC is disabled.\n");
@@ -966,14 +1092,16 @@ int gpt2_save_alc_state(const GPT2* model, const char* path) {
         return 0;
     }
     ALCCheckpointHeader h = {
-        .magic = 0x414C4331, // ALC1
+        .magic = 0x414C4331u, // ASCII "ALC1"
         .version = 1,
-        .channels = model->config.channels,
-        .num_slots = model->alc_config.alc_num_slots,
-        .slot_dim = model->alc_config.alc_slot_dim,
-        .key_dim = model->alc_config.alc_key_dim,
-        .fusion_mode = model->alc_config.alc_fusion_mode,
-        .update_mode = model->alc_config.alc_update_mode,
+        .endian_marker = 0x01020304u,
+        .header_bytes = (uint32_t)sizeof(ALCCheckpointHeader),
+        .channels = (uint32_t)model->config.channels,
+        .num_slots = (uint32_t)model->alc_config.alc_num_slots,
+        .slot_dim = (uint32_t)model->alc_config.alc_slot_dim,
+        .key_dim = (uint32_t)model->alc_config.alc_key_dim,
+        .fusion_mode = (uint32_t)model->alc_config.alc_fusion_mode,
+        .update_mode = (uint32_t)model->alc_config.alc_update_mode,
     };
     fwriteCheck(&h, sizeof(ALCCheckpointHeader), 1, f);
     int C = model->config.channels;
@@ -1005,8 +1133,19 @@ int gpt2_load_alc_state(GPT2* model, const char* path, int B, int T) {
     }
     ALCCheckpointHeader h;
     freadCheck(&h, sizeof(ALCCheckpointHeader), 1, f);
-    if (h.magic != 0x414C4331 || h.version != 1) {
-        fprintf(stderr, "[ALC] incompatible state file '%s': bad magic/version (%d/%d)\n", path, h.magic, h.version);
+    if (h.magic != 0x414C4331u || h.version != 1u) {
+        fprintf(stderr, "[ALC] incompatible state file '%s': bad magic/version (%u/%u)\n", path, h.magic, h.version);
+        fcloseCheck(f);
+        exit(1);
+    }
+    if (h.endian_marker != 0x01020304u) {
+        fprintf(stderr, "[ALC] incompatible state file '%s': unsupported endianness marker 0x%08x\n", path, h.endian_marker);
+        fcloseCheck(f);
+        exit(1);
+    }
+    if (h.header_bytes != sizeof(ALCCheckpointHeader)) {
+        fprintf(stderr, "[ALC] incompatible state file '%s': header size mismatch (%u vs %zu)\n",
+                path, h.header_bytes, sizeof(ALCCheckpointHeader));
         fcloseCheck(f);
         exit(1);
     }
@@ -1033,6 +1172,12 @@ int gpt2_load_alc_state(GPT2* model, const char* path, int B, int T) {
     freadCheck(model->alc.gate_b, sizeof(float), (size_t)C, f);
     freadCheck(model->alc.slot_keys, sizeof(float), (size_t)S * K, f);
     freadCheck(model->alc.slots, sizeof(float), (size_t)S * D, f);
+    int next = fgetc(f);
+    if (next != EOF) {
+        fprintf(stderr, "[ALC] incompatible state file '%s': trailing bytes detected\n", path);
+        fcloseCheck(f);
+        exit(1);
+    }
     fcloseCheck(f);
     return 1;
 }
@@ -1204,6 +1349,7 @@ void gpt2_forward(GPT2 *model, int* inputs, int* targets, size_t B, size_t T) {
 
     if (model->alc_config.use_alc) {
         gpt2_init_alc_state(model, B, T);
+        alc_ensure_layer_traces(model, B, T);
         if (!model->alc.logged_enable_message) {
             printf("[ALC] enabled: slots=%d slot_dim=%d key_dim=%d fusion_mode=%s update_mode=%s apply_every_n_layers=%d update_rate=%.4f\n",
                    model->alc_config.alc_num_slots,
@@ -1213,6 +1359,8 @@ void gpt2_forward(GPT2 *model, int* inputs, int* targets, size_t B, size_t T) {
                    alc_update_mode_name(model->alc_config.alc_update_mode),
                    model->alc_config.alc_apply_every_n_layers,
                    model->alc_config.alc_update_rate);
+            printf("[ALC] training semantics: gradients={slot_to_hidden%s} state_updates={slots,slot_keys} nondiff={query_proj,write_proj}\n",
+                   model->alc_config.alc_fusion_mode == ALC_FUSION_GATED ? ",gate_h,gate_a,gate_b" : "");
             model->alc.logged_enable_message = 1;
         }
     }
@@ -1275,7 +1423,7 @@ void gpt2_forward(GPT2 *model, int* inputs, int* targets, size_t B, size_t T) {
         if (model->alc_config.use_alc) { model->alc.layer_checks++; }
         if (alc_apply) {
             model->alc.layers_applied++;
-            alc_forward_read_and_fuse(model, l_residual3, B, T);
+            alc_forward_read_and_fuse(model, l_residual3, B, T, l);
             int do_update = (model->alc_config.alc_update_mode == ALC_UPDATE_ALWAYS)
                 || (model->alc_config.alc_update_mode == ALC_UPDATE_TRAIN_ONLY && targets != NULL);
             if (do_update) {
@@ -1320,6 +1468,9 @@ void gpt2_forward(GPT2 *model, int* inputs, int* targets, size_t B, size_t T) {
 void gpt2_zero_grad(GPT2 *model) {
     if(model->grads_memory != NULL) { memset(model->grads_memory, 0, model->num_parameters * sizeof(float)); }
     if(model->grads_acts_memory != NULL) { memset(model->grads_acts_memory, 0, model->num_activations * sizeof(float)); }
+    if (model->alc_config.use_alc && model->alc.initialized) {
+        alc_zero_param_grads(&model->alc, model->config.channels, model->alc_config.alc_slot_dim);
+    }
 }
 
 void gpt2_backward(GPT2 *model) {
@@ -1345,6 +1496,9 @@ void gpt2_backward(GPT2 *model) {
     size_t L = model->config.num_layers;
     size_t NH = model->config.num_heads;
     size_t C = model->config.channels;
+    if (model->alc_config.use_alc && model->alc.initialized) {
+        alc_ensure_grad_buffers(model);
+    }
 
     // backward pass: go in the reverse order of the forward pass, and call backward() functions
     ParameterTensors params = model->params; // for brevity
@@ -1417,6 +1571,9 @@ void gpt2_backward(GPT2 *model) {
         float* dl_residual3 = grads_acts.residual3 + l * B * T * C;
 
         // backprop this layer
+        if (model->alc_config.use_alc && alc_layer_enabled(model, l)) {
+            alc_backward_fuse_and_accumulate(model, l, dl_residual3, B, T);
+        }
         residual_backward(dl_residual2, dl_fcproj, dl_residual3, B*T*C);
         matmul_backward(dl_fch_gelu, dl_fcprojw, dl_fcprojb, dl_fcproj, l_fch_gelu, l_fcprojw, B, T, 4*C, C);
         gelu_backward(dl_fch, l_fch, dl_fch_gelu, B*T*4*C);
@@ -1457,6 +1614,21 @@ void gpt2_update(GPT2 *model, float learning_rate, float beta1, float beta2, flo
         model->v_memory[i] = v;
         model->params_memory[i] -= learning_rate * (m_hat / (sqrtf(v_hat) + eps) + weight_decay * param);
     }
+    if (model->alc_config.use_alc && model->alc.initialized && model->alc.d_slot_to_hidden != NULL) {
+        size_t C = model->config.channels;
+        size_t D = model->alc_config.alc_slot_dim;
+        alc_adamw_update(model->alc.slot_to_hidden, model->alc.d_slot_to_hidden,
+                         model->alc.m_slot_to_hidden, model->alc.v_slot_to_hidden,
+                         C * D, learning_rate, beta1, beta2, eps, weight_decay, t);
+        if (model->alc_config.alc_fusion_mode == ALC_FUSION_GATED) {
+            alc_adamw_update(model->alc.gate_h, model->alc.d_gate_h, model->alc.m_gate_h, model->alc.v_gate_h,
+                             C, learning_rate, beta1, beta2, eps, weight_decay, t);
+            alc_adamw_update(model->alc.gate_a, model->alc.d_gate_a, model->alc.m_gate_a, model->alc.v_gate_a,
+                             C, learning_rate, beta1, beta2, eps, weight_decay, t);
+            alc_adamw_update(model->alc.gate_b, model->alc.d_gate_b, model->alc.m_gate_b, model->alc.v_gate_b,
+                             C, learning_rate, beta1, beta2, eps, weight_decay, t);
+        }
+    }
 }
 
 void gpt2_free(GPT2 *model) {
@@ -1480,6 +1652,21 @@ void gpt2_free(GPT2 *model) {
     free(model->alc.retrieved_buffer);
     free(model->alc.selected_slots);
     free(model->alc.slot_hit_counts);
+    free(model->alc.hidden_pre_layers);
+    free(model->alc.retrieved_layers);
+    free(model->alc.selected_slots_layers);
+    free(model->alc.d_slot_to_hidden);
+    free(model->alc.d_gate_h);
+    free(model->alc.d_gate_a);
+    free(model->alc.d_gate_b);
+    free(model->alc.m_slot_to_hidden);
+    free(model->alc.v_slot_to_hidden);
+    free(model->alc.m_gate_h);
+    free(model->alc.v_gate_h);
+    free(model->alc.m_gate_a);
+    free(model->alc.v_gate_a);
+    free(model->alc.m_gate_b);
+    free(model->alc.v_gate_b);
 }
 
 #ifndef TESTING
