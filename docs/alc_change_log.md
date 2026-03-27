@@ -1,38 +1,50 @@
 # ALC Change Log
 
-## Pass: mathematical correctness + numerical stability hardening
+## 2026-03-27 — Differentiable routing redesign
 
 ### `train_gpt2.c`
-- Added explicit ALC runtime invariant helpers and `[ALC]` failure paths for:
-  - config/runtime mode/range checks
-  - selected slot bounds checks in forward/write/backward
-  - finite checks on routing scores, gate logits, fused hidden, write projections, slot/key updates, and loaded persisted tensors.
-- Tightened forward math and stability behavior:
-  - routing score scaling by `1/sqrt(key_dim)`
-  - gate-logit clamp to `[-40, 40]` in gated fusion
-  - additive fusion norm-ratio guard to prevent runaway retrieved contribution
-- Tightened write/update stability behavior:
-  - high-cap write-vector and slot/key norm guards (`1e6`) to avoid catastrophic drift.
-- Updated backward gated derivative path to match forward clamp semantics.
 
-### `dev/test/alc_hardening.c` (new)
-- Added artifact-independent hardening suite covering:
-  - finite-difference gradient checks (representative subset) for `slot_to_hidden`, `gate_h`, `gate_a`, `gate_b`
-  - analytic gradient finiteness + non-zero gate-gradient presence checks
-  - EMA write semantics for `eta=0`, `eta=1`, and repeated small-eta convergence
-  - non-selected slot immutability assertions
-  - persistence save/load identity into a fresh model with exact tensor/logit comparisons
-  - long-run stress loop with norm/gate/index/hit-histogram monitoring and explicit thresholds.
+- Replaced hard argmax-only routing with configurable routing modes:
+  - `hard_top1`
+  - `softmax`
+  - `topk_softmax` (default)
+- Added new ALC config fields and validation:
+  - `alc_routing_mode`
+  - `alc_topk`
+  - `alc_temperature`
+- Implemented numerically stable routing softmax (`max` subtraction + temperature).
+- Replaced single-slot retrieval with routing-weighted retrieval:
+  - `a = sum_j p_j v_j`
+- Added per-token routing probability traces for backward and write paths.
+- Updated ALC backward path to propagate differentiable routing gradients into `query_proj` for soft routing modes.
+- Added optimizer/gradient buffers and AdamW updates for `query_proj` (soft routing modes).
+- Reworked write semantics from hard selected-slot EMA to routing-weighted EMA updates for slots and keys.
+- Preserved existing fusion behavior and safety guards (gate clamp, finite checks, norm caps).
+
+### `dev/test/alc_smoke.c`
+
+- Added routing normalization and top-k activity checks (`sum(p)=1`, active slots `<= topk`).
+
+### `dev/test/tiny_alc_e2e.c`
+
+- Switched tiny e2e ALC configuration to differentiable top-k routing.
+- Added assertion that `query_proj` receives non-zero gradient signal.
+
+### `dev/test/alc_hardening.c`
+
+- Added explicit routing normalization and top-k masking assertions.
+- Added non-zero/finite `query_proj` gradient checks.
+- Updated EMA write-rule tests to verify routing-weighted write math.
 
 ### `docs/adaptive_learning_component.md`
-- Reworked as a correctness/stability design contract with sections for:
-  - Mathematical correctness audit (implemented equations only)
-  - Numerical stability decisions with rationale
-  - Gradient-check coverage and tolerances
-  - EMA stability analysis
-  - Persistence test contract
-  - Long-run stress summary and thresholds
-  - Proven invariants and remaining mathematical limitations.
+
+- Added full redesign section:
+  - old hard routing vs new differentiable routing math
+  - read/write equations now implemented
+  - differentiable vs stateful tensor semantics
+  - resolved hard-routing limitation and remaining constraints
 
 ### `README.md`
-- Added artifact-independent hardening test build/run commands and clarified what the hardening suite proves.
+
+- Updated ALC section to describe differentiable routing modes and new env vars.
+- Updated training semantics to mark `query_proj` as gradient-trained in soft routing modes.

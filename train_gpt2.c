@@ -544,6 +544,12 @@ typedef enum {
     ALC_UPDATE_ALWAYS = 2,
 } ALCUpdateMode;
 
+typedef enum {
+    ALC_ROUTING_HARD_TOP1 = 0,
+    ALC_ROUTING_SOFTMAX = 1,
+    ALC_ROUTING_TOPK_SOFTMAX = 2,
+} ALCRoutingMode;
+
 typedef struct {
     int use_alc; // feature gate; keeps baseline path untouched when 0
     int alc_num_slots; // number of adaptive slots in memory table
@@ -554,6 +560,9 @@ typedef struct {
     int alc_update_mode; // see ALCUpdateMode
     int alc_apply_every_n_layers; // apply ALC on every nth transformer layer
     float alc_additive_scale; // scale for additive fusion
+    int alc_routing_mode; // see ALCRoutingMode
+    int alc_topk; // top-k slots for sparse soft routing
+    float alc_temperature; // routing temperature (>0)
 } ALCConfig;
 
 typedef struct {
@@ -571,6 +580,7 @@ typedef struct {
     float* query_buffer; // (B*T, K)
     float* retrieved_buffer; // (B*T, C)
     int* selected_slots; // (B*T)
+    float* routing_probs; // (B*T, S)
     int initialized;
     int logged_enable_message;
     int debug_enabled;
@@ -585,14 +595,18 @@ typedef struct {
     float* hidden_pre_layers; // (L, B*T, C)
     float* retrieved_layers; // (L, B*T, C)
     int* selected_slots_layers; // (L, B*T)
+    float* routing_probs_layers; // (L, B*T, S)
     int trace_bt;
     // gradients + optimizer state for trainable differentiable ALC tensors
+    float* d_query_proj; // (K, C)
     float* d_slot_to_hidden; // (C, D)
     float* d_gate_h; // (C)
     float* d_gate_a; // (C)
     float* d_gate_b; // (C)
     float* m_slot_to_hidden; // Adam first moment
     float* v_slot_to_hidden; // Adam second moment
+    float* m_query_proj;
+    float* v_query_proj;
     float* m_gate_h;
     float* v_gate_h;
     float* m_gate_a;
@@ -840,6 +854,15 @@ static const char* alc_update_mode_name(int mode) {
     }
 }
 
+static const char* alc_routing_mode_name(int mode) {
+    switch (mode) {
+        case ALC_ROUTING_HARD_TOP1: return "hard_top1";
+        case ALC_ROUTING_SOFTMAX: return "softmax";
+        case ALC_ROUTING_TOPK_SOFTMAX: return "topk_softmax";
+        default: return "unknown";
+    }
+}
+
 typedef struct {
     uint32_t magic;
     uint32_t version;
@@ -880,6 +903,20 @@ static void gpt2_validate_alc_config(const GPT2* model) {
         fprintf(stderr, "[ALC] invalid config: alc_update_mode=%d (valid: 0 off, 1 train_only, 2 always)\n", cfg->alc_update_mode);
         exit(1);
     }
+    if (cfg->alc_routing_mode < ALC_ROUTING_HARD_TOP1 || cfg->alc_routing_mode > ALC_ROUTING_TOPK_SOFTMAX) {
+        fprintf(stderr, "[ALC] invalid config: alc_routing_mode=%d (valid: 0 hard_top1, 1 softmax, 2 topk_softmax)\n",
+                cfg->alc_routing_mode);
+        exit(1);
+    }
+    if (cfg->alc_temperature <= 0.0f) {
+        fprintf(stderr, "[ALC] invalid config: alc_temperature=%.6f (must be >0)\n", cfg->alc_temperature);
+        exit(1);
+    }
+    if (cfg->alc_topk <= 0 || cfg->alc_topk > cfg->alc_num_slots) {
+        fprintf(stderr, "[ALC] invalid config: alc_topk=%d (must be in [1, alc_num_slots=%d])\n",
+                cfg->alc_topk, cfg->alc_num_slots);
+        exit(1);
+    }
     if (model->config.channels <= 0) { fprintf(stderr, "[ALC] invalid model channels=%d\n", model->config.channels); exit(1); }
     alc_require(cfg->alc_slot_dim > 0 && cfg->alc_key_dim > 0, "invalid dimensions: slot_dim/key_dim must be > 0");
     alc_require(cfg->alc_num_slots > 0, "invalid dimensions: num_slots must be > 0");
@@ -888,6 +925,10 @@ static void gpt2_validate_alc_config(const GPT2* model) {
                 "invalid fusion mode");
     alc_require(cfg->alc_update_mode >= ALC_UPDATE_OFF && cfg->alc_update_mode <= ALC_UPDATE_ALWAYS,
                 "invalid update mode");
+    alc_require(cfg->alc_routing_mode >= ALC_ROUTING_HARD_TOP1 && cfg->alc_routing_mode <= ALC_ROUTING_TOPK_SOFTMAX,
+                "invalid routing mode");
+    alc_require(cfg->alc_temperature > 0.0f, "invalid routing temperature: must be > 0");
+    alc_require(cfg->alc_topk > 0 && cfg->alc_topk <= cfg->alc_num_slots, "invalid top-k routing value");
 }
 
 static void gpt2_init_alc_state(GPT2* model, int B, int T) {
@@ -904,9 +945,11 @@ static void gpt2_init_alc_state(GPT2* model, int B, int T) {
             free(model->alc.query_buffer);
             free(model->alc.retrieved_buffer);
             free(model->alc.selected_slots);
+            free(model->alc.routing_probs);
             model->alc.query_buffer = (float*)mallocCheck((size_t)BT * K * sizeof(float));
             model->alc.retrieved_buffer = (float*)mallocCheck((size_t)BT * C * sizeof(float));
             model->alc.selected_slots = (int*)mallocCheck((size_t)BT * sizeof(int));
+            model->alc.routing_probs = (float*)mallocCheck((size_t)BT * S * sizeof(float));
             model->alc.scratch_bt = BT;
         }
         return;
@@ -925,6 +968,7 @@ static void gpt2_init_alc_state(GPT2* model, int B, int T) {
     model->alc.query_buffer = (float*)mallocCheck((size_t)BT * K * sizeof(float));
     model->alc.retrieved_buffer = (float*)mallocCheck((size_t)BT * C * sizeof(float));
     model->alc.selected_slots = (int*)mallocCheck((size_t)BT * sizeof(int));
+    model->alc.routing_probs = (float*)mallocCheck((size_t)BT * S * sizeof(float));
     for (int i = 0; i < K * C; i++) { model->alc.query_proj[i] = (ALC_NEXT_RAND() * 2.0f - 1.0f) * 0.02f; }
     for (int i = 0; i < D * C; i++) { model->alc.write_proj[i] = (ALC_NEXT_RAND() * 2.0f - 1.0f) * 0.01f; }
     for (int i = 0; i < C * D; i++) { model->alc.slot_to_hidden[i] = (ALC_NEXT_RAND() * 2.0f - 1.0f) * 0.01f; }
@@ -947,19 +991,23 @@ static void alc_ensure_layer_traces(GPT2* model, int B, int T) {
     int L = model->config.num_layers;
     int C = model->config.channels;
     if (model->alc.trace_bt == BT && model->alc.hidden_pre_layers != NULL &&
-        model->alc.retrieved_layers != NULL && model->alc.selected_slots_layers != NULL) {
+        model->alc.retrieved_layers != NULL && model->alc.selected_slots_layers != NULL &&
+        model->alc.routing_probs_layers != NULL) {
         return;
     }
     free(model->alc.hidden_pre_layers);
     free(model->alc.retrieved_layers);
     free(model->alc.selected_slots_layers);
+    free(model->alc.routing_probs_layers);
     model->alc.hidden_pre_layers = (float*)mallocCheck((size_t)L * BT * C * sizeof(float));
     model->alc.retrieved_layers = (float*)mallocCheck((size_t)L * BT * C * sizeof(float));
     model->alc.selected_slots_layers = (int*)mallocCheck((size_t)L * BT * sizeof(int));
+    model->alc.routing_probs_layers = (float*)mallocCheck((size_t)L * BT * model->alc_config.alc_num_slots * sizeof(float));
     model->alc.trace_bt = BT;
 }
 
-static void alc_zero_param_grads(ALCState* alc, int C, int D) {
+static void alc_zero_param_grads(ALCState* alc, int C, int D, int K) {
+    if (alc->d_query_proj != NULL) { memset(alc->d_query_proj, 0, (size_t)K * C * sizeof(float)); }
     if (alc->d_slot_to_hidden != NULL) { memset(alc->d_slot_to_hidden, 0, (size_t)C * D * sizeof(float)); }
     if (alc->d_gate_h != NULL) { memset(alc->d_gate_h, 0, (size_t)C * sizeof(float)); }
     if (alc->d_gate_a != NULL) { memset(alc->d_gate_a, 0, (size_t)C * sizeof(float)); }
@@ -970,7 +1018,11 @@ static void alc_ensure_grad_buffers(GPT2* model) {
     if (!model->alc_config.use_alc || !model->alc.initialized) { return; }
     int C = model->config.channels;
     int D = model->alc_config.alc_slot_dim;
+    int K = model->alc_config.alc_key_dim;
     if (model->alc.d_slot_to_hidden == NULL) {
+        model->alc.d_query_proj = (float*)calloc((size_t)K * C, sizeof(float));
+        model->alc.m_query_proj = (float*)calloc((size_t)K * C, sizeof(float));
+        model->alc.v_query_proj = (float*)calloc((size_t)K * C, sizeof(float));
         model->alc.d_slot_to_hidden = (float*)calloc((size_t)C * D, sizeof(float));
         model->alc.m_slot_to_hidden = (float*)calloc((size_t)C * D, sizeof(float));
         model->alc.v_slot_to_hidden = (float*)calloc((size_t)C * D, sizeof(float));
@@ -1007,10 +1059,13 @@ static void alc_forward_read_and_fuse(GPT2* model, float* hidden, int B, int T, 
     float* layer_hidden_pre = model->alc.hidden_pre_layers + (size_t)layer * BT * C;
     float* layer_retrieved = model->alc.retrieved_layers + (size_t)layer * BT * C;
     int* layer_slots = model->alc.selected_slots_layers + (size_t)layer * BT;
+    float* layer_probs = model->alc.routing_probs_layers + (size_t)layer * BT * S;
     for (int bt = 0; bt < BT; bt++) {
         float* h = hidden + (size_t)bt * C;
         memcpy(layer_hidden_pre + (size_t)bt * C, h, (size_t)C * sizeof(float));
         float* q = model->alc.query_buffer + (size_t)bt * K;
+        float* probs = model->alc.routing_probs + (size_t)bt * S;
+        float scores[S];
         for (int k = 0; k < K; k++) {
             float sum = 0.0f;
             const float* wrow = model->alc.query_proj + (size_t)k * C;
@@ -1025,18 +1080,83 @@ static void alc_forward_read_and_fuse(GPT2* model, float* hidden, int B, int T, 
             for (int k = 0; k < K; k++) { score += q[k] * sk[k]; }
             score *= routing_scale;
             alc_check_finite_scalar(score, "routing_scores");
+            scores[s] = score;
             if (score > best_score) { best_score = score; best_slot = s; }
         }
         alc_require(best_slot >= 0 && best_slot < S, "selected slot index out of bounds");
+        for (int s = 0; s < S; s++) { probs[s] = 0.0f; }
+        if (model->alc_config.alc_routing_mode == ALC_ROUTING_HARD_TOP1) {
+            probs[best_slot] = 1.0f;
+        } else if (model->alc_config.alc_routing_mode == ALC_ROUTING_SOFTMAX) {
+            float smax = -INFINITY;
+            for (int s = 0; s < S; s++) { if (scores[s] > smax) { smax = scores[s]; } }
+            float denom = 0.0f;
+            float inv_tau = 1.0f / model->alc_config.alc_temperature;
+            for (int s = 0; s < S; s++) {
+                float z = (scores[s] - smax) * inv_tau;
+                float e = expf(z);
+                probs[s] = e;
+                denom += e;
+            }
+            alc_require(denom > 0.0f && isfinite(denom), "invalid routing softmax denominator");
+            for (int s = 0; s < S; s++) { probs[s] /= denom; }
+        } else {
+            int topk = model->alc_config.alc_topk;
+            int topk_idx[topk];
+            float topk_score[topk];
+            for (int i = 0; i < topk; i++) { topk_idx[i] = -1; topk_score[i] = -INFINITY; }
+            for (int s = 0; s < S; s++) {
+                float sc = scores[s];
+                int insert = -1;
+                for (int i = 0; i < topk; i++) {
+                    if (sc > topk_score[i]) { insert = i; break; }
+                }
+                if (insert >= 0) {
+                    for (int i = topk - 1; i > insert; i--) {
+                        topk_score[i] = topk_score[i - 1];
+                        topk_idx[i] = topk_idx[i - 1];
+                    }
+                    topk_score[insert] = sc;
+                    topk_idx[insert] = s;
+                }
+            }
+            float smax = topk_score[0];
+            float denom = 0.0f;
+            float inv_tau = 1.0f / model->alc_config.alc_temperature;
+            for (int i = 0; i < topk; i++) {
+                alc_require(topk_idx[i] >= 0 && topk_idx[i] < S, "invalid top-k routing index");
+                float z = (topk_score[i] - smax) * inv_tau;
+                float e = expf(z);
+                probs[topk_idx[i]] = e;
+                denom += e;
+            }
+            alc_require(denom > 0.0f && isfinite(denom), "invalid top-k routing softmax denominator");
+            for (int i = 0; i < topk; i++) {
+                probs[topk_idx[i]] /= denom;
+            }
+        }
+        float prob_sum = 0.0f;
+        for (int s = 0; s < S; s++) { prob_sum += probs[s]; }
+        alc_require(fabsf(prob_sum - 1.0f) < 1e-3f, "routing probabilities must sum to 1");
         model->alc.selected_slots[bt] = best_slot;
         layer_slots[bt] = best_slot;
+        memcpy(layer_probs + (size_t)bt * S, probs, (size_t)S * sizeof(float));
         if (model->alc.slot_hit_counts != NULL) { model->alc.slot_hit_counts[best_slot]++; }
         float* retrieved = model->alc.retrieved_buffer + (size_t)bt * C;
-        const float* slot = model->alc.slots + (size_t)best_slot * D;
+        float adaptive[D];
+        for (int d = 0; d < D; d++) { adaptive[d] = 0.0f; }
+        for (int s = 0; s < S; s++) {
+            const float p = probs[s];
+            if (p == 0.0f) { continue; }
+            const float* slot = model->alc.slots + (size_t)s * D;
+            for (int d = 0; d < D; d++) {
+                adaptive[d] += p * slot[d];
+            }
+        }
         for (int c = 0; c < C; c++) {
             const float* proj = model->alc.slot_to_hidden + (size_t)c * D;
             float mapped = 0.0f;
-            for (int d = 0; d < D; d++) { mapped += proj[d] * slot[d]; }
+            for (int d = 0; d < D; d++) { mapped += proj[d] * adaptive[d]; }
             retrieved[c] = mapped;
         }
         alc_check_finite_buffer(retrieved, (size_t)C, "retrieved_buffer");
@@ -1077,12 +1197,10 @@ static void alc_write_update(GPT2* model, float* hidden, int B, int T) {
     model->alc.total_writes += BT;
     alc_require(eta >= 0.0f && eta <= 1.0f, "alc_update_rate out of range in write_update");
     for (int bt = 0; bt < BT; bt++) {
-        int slot_idx = model->alc.selected_slots[bt];
-        alc_require(slot_idx >= 0 && slot_idx < model->alc_config.alc_num_slots, "selected slot index out of bounds in write_update");
-        float* slot = model->alc.slots + (size_t)slot_idx * D;
-        float* key = model->alc.slot_keys + (size_t)slot_idx * K;
+        const float* probs = model->alc.routing_probs + (size_t)bt * model->alc_config.alc_num_slots;
         const float* q = model->alc.query_buffer + (size_t)bt * K;
         const float* h = hidden + (size_t)bt * C;
+        float write_vec[D];
         float write_norm_ss = 0.0f;
         for (int d = 0; d < D; d++) {
             const float* wrow = model->alc.write_proj + (size_t)d * C;
@@ -1090,26 +1208,37 @@ static void alc_write_update(GPT2* model, float* hidden, int B, int T) {
             for (int j = 0; j < C; j++) { projected += wrow[j] * h[j]; }
             alc_check_finite_scalar(projected, "slot_write_projection");
             write_norm_ss += projected * projected;
-            if (write_norm_ss > write_norm_cap * write_norm_cap) {
-                projected *= write_norm_cap / (sqrtf(write_norm_ss) + 1e-12f);
+            write_vec[d] = projected;
+        }
+        if (write_norm_ss > write_norm_cap * write_norm_cap) {
+            float mul = write_norm_cap / (sqrtf(write_norm_ss) + 1e-12f);
+            for (int d = 0; d < D; d++) { write_vec[d] *= mul; }
+        }
+        for (int s = 0; s < model->alc_config.alc_num_slots; s++) {
+            float p = probs[s];
+            if (p <= 0.0f) { continue; }
+            float alpha = eta * p;
+            float* slot = model->alc.slots + (size_t)s * D;
+            float* key = model->alc.slot_keys + (size_t)s * K;
+            for (int d = 0; d < D; d++) {
+                slot[d] = (1.0f - alpha) * slot[d] + alpha * write_vec[d];
             }
-            slot[d] = (1.0f - eta) * slot[d] + eta * projected;
+            for (int k = 0; k < K; k++) {
+                key[k] = (1.0f - alpha) * key[k] + alpha * q[k];
+            }
+            float slot_norm = alc_l2_norm(slot, D);
+            float key_norm = alc_l2_norm(key, K);
+            if (slot_norm > slot_norm_cap) {
+                float mul = slot_norm_cap / (slot_norm + 1e-12f);
+                for (int d = 0; d < D; d++) { slot[d] *= mul; }
+            }
+            if (key_norm > key_norm_cap) {
+                float mul = key_norm_cap / (key_norm + 1e-12f);
+                for (int k = 0; k < K; k++) { key[k] *= mul; }
+            }
+            alc_check_finite_buffer(slot, (size_t)D, "slot_updates");
+            alc_check_finite_buffer(key, (size_t)K, "key_updates");
         }
-        for (int k = 0; k < K; k++) {
-            key[k] = (1.0f - eta) * key[k] + eta * q[k];
-        }
-        float slot_norm = alc_l2_norm(slot, D);
-        float key_norm = alc_l2_norm(key, K);
-        if (slot_norm > slot_norm_cap) {
-            float mul = slot_norm_cap / (slot_norm + 1e-12f);
-            for (int d = 0; d < D; d++) { slot[d] *= mul; }
-        }
-        if (key_norm > key_norm_cap) {
-            float mul = key_norm_cap / (key_norm + 1e-12f);
-            for (int k = 0; k < K; k++) { key[k] *= mul; }
-        }
-        alc_check_finite_buffer(slot, (size_t)D, "slot_updates");
-        alc_check_finite_buffer(key, (size_t)K, "key_updates");
     }
 }
 
@@ -1118,18 +1247,32 @@ static void alc_backward_fuse_and_accumulate(GPT2* model, int layer, float* d_hi
     int BT = B * T;
     int C = model->config.channels;
     int D = model->alc_config.alc_slot_dim;
+    int K = model->alc_config.alc_key_dim;
+    int S = model->alc_config.alc_num_slots;
     const float gate_logit_abs_cap = 40.0f;
+    const float routing_scale = 1.0f / sqrtf((float)K);
     const float* layer_hidden_pre = model->alc.hidden_pre_layers + (size_t)layer * BT * C;
     const float* layer_retrieved = model->alc.retrieved_layers + (size_t)layer * BT * C;
     const int* layer_slots = model->alc.selected_slots_layers + (size_t)layer * BT;
+    const float* layer_probs = model->alc.routing_probs_layers + (size_t)layer * BT * S;
     alc_require(model->alc.d_slot_to_hidden != NULL, "missing grad buffer d_slot_to_hidden");
+    alc_require(model->alc.d_query_proj != NULL, "missing grad buffer d_query_proj");
     for (int bt = 0; bt < BT; bt++) {
         float* d_h = d_hidden_out + (size_t)bt * C;
         const float* h_pre = layer_hidden_pre + (size_t)bt * C;
         const float* retrieved = layer_retrieved + (size_t)bt * C;
         int slot_idx = layer_slots[bt];
+        const float* probs = layer_probs + (size_t)bt * S;
         alc_require(slot_idx >= 0 && slot_idx < model->alc_config.alc_num_slots, "selected slot index out of bounds in backward");
-        const float* slot = model->alc.slots + (size_t)slot_idx * D;
+        float adaptive[D];
+        for (int d = 0; d < D; d++) { adaptive[d] = 0.0f; }
+        for (int s = 0; s < S; s++) {
+            if (probs[s] == 0.0f) { continue; }
+            const float* slot = model->alc.slots + (size_t)s * D;
+            for (int d = 0; d < D; d++) { adaptive[d] += probs[s] * slot[d]; }
+        }
+        float d_adaptive[D];
+        for (int d = 0; d < D; d++) { d_adaptive[d] = 0.0f; }
         for (int c = 0; c < C; c++) {
             float d_out = d_h[c];
             float d_retrieved = model->alc_config.alc_additive_scale * d_out;
@@ -1151,7 +1294,36 @@ static void alc_backward_fuse_and_accumulate(GPT2* model, int layer, float* d_hi
             }
             float* d_proj_row = model->alc.d_slot_to_hidden + (size_t)c * D;
             for (int d = 0; d < D; d++) {
-                d_proj_row[d] += d_retrieved * slot[d];
+                d_proj_row[d] += d_retrieved * adaptive[d];
+                d_adaptive[d] += d_retrieved * model->alc.slot_to_hidden[(size_t)c * D + d];
+            }
+        }
+        if (model->alc_config.alc_routing_mode != ALC_ROUTING_HARD_TOP1) {
+            float d_prob[S];
+            float pdotp = 0.0f;
+            for (int s = 0; s < S; s++) {
+                const float* slot = model->alc.slots + (size_t)s * D;
+                float dp = 0.0f;
+                for (int d = 0; d < D; d++) { dp += d_adaptive[d] * slot[d]; }
+                d_prob[s] = dp;
+                pdotp += probs[s] * dp;
+            }
+            float d_q[K];
+            for (int k = 0; k < K; k++) { d_q[k] = 0.0f; }
+            float inv_tau = 1.0f / model->alc_config.alc_temperature;
+            for (int s = 0; s < S; s++) {
+                if (probs[s] == 0.0f) { continue; }
+                float d_score = probs[s] * (d_prob[s] - pdotp) * inv_tau;
+                const float* sk = model->alc.slot_keys + (size_t)s * K;
+                for (int k = 0; k < K; k++) {
+                    d_q[k] += d_score * routing_scale * sk[k];
+                }
+            }
+            for (int k = 0; k < K; k++) {
+                float* d_qrow = model->alc.d_query_proj + (size_t)k * C;
+                for (int c = 0; c < C; c++) {
+                    d_qrow[c] += d_q[k] * h_pre[c];
+                }
             }
         }
         alc_check_finite_buffer(d_h, (size_t)C, "d_hidden_post_alc");
@@ -1354,6 +1526,9 @@ void gpt2_build_from_checkpoint(GPT2 *model, const char* checkpoint_path) {
         .alc_update_mode = ALC_UPDATE_TRAIN_ONLY,
         .alc_apply_every_n_layers = 1,
         .alc_additive_scale = 1.0f,
+        .alc_routing_mode = ALC_ROUTING_TOPK_SOFTMAX,
+        .alc_topk = 4,
+        .alc_temperature = 1.0f,
     };
     memset(&model->alc, 0, sizeof(ALCState));
 }
@@ -1393,6 +1568,9 @@ void gpt2_build_from_synthetic(GPT2 *model, GPT2Config config) {
         .alc_update_mode = ALC_UPDATE_TRAIN_ONLY,
         .alc_apply_every_n_layers = 1,
         .alc_additive_scale = 1.0f,
+        .alc_routing_mode = ALC_ROUTING_TOPK_SOFTMAX,
+        .alc_topk = 4,
+        .alc_temperature = 1.0f,
     };
     memset(&model->alc, 0, sizeof(ALCState));
 }
@@ -1457,16 +1635,20 @@ void gpt2_forward(GPT2 *model, int* inputs, int* targets, size_t B, size_t T) {
         gpt2_init_alc_state(model, B, T);
         alc_ensure_layer_traces(model, B, T);
         if (!model->alc.logged_enable_message) {
-            printf("[ALC] enabled: slots=%d slot_dim=%d key_dim=%d fusion_mode=%s update_mode=%s apply_every_n_layers=%d update_rate=%.4f\n",
+            printf("[ALC] enabled: slots=%d slot_dim=%d key_dim=%d fusion_mode=%s update_mode=%s routing_mode=%s topk=%d temperature=%.4f apply_every_n_layers=%d update_rate=%.4f\n",
                    model->alc_config.alc_num_slots,
                    model->alc_config.alc_slot_dim,
                    model->alc_config.alc_key_dim,
                    alc_fusion_mode_name(model->alc_config.alc_fusion_mode),
                    alc_update_mode_name(model->alc_config.alc_update_mode),
+                   alc_routing_mode_name(model->alc_config.alc_routing_mode),
+                   model->alc_config.alc_topk,
+                   model->alc_config.alc_temperature,
                    model->alc_config.alc_apply_every_n_layers,
                    model->alc_config.alc_update_rate);
-            printf("[ALC] training semantics: gradients={slot_to_hidden%s} state_updates={slots,slot_keys} nondiff={query_proj,write_proj}\n",
-                   model->alc_config.alc_fusion_mode == ALC_FUSION_GATED ? ",gate_h,gate_a,gate_b" : "");
+            printf("[ALC] training semantics: gradients={slot_to_hidden%s%s} state_updates={slots,slot_keys} nondiff={write_proj}\n",
+                   model->alc_config.alc_fusion_mode == ALC_FUSION_GATED ? ",gate_h,gate_a,gate_b" : "",
+                   model->alc_config.alc_routing_mode == ALC_ROUTING_HARD_TOP1 ? "" : ",query_proj");
             model->alc.logged_enable_message = 1;
         }
     }
@@ -1575,7 +1757,7 @@ void gpt2_zero_grad(GPT2 *model) {
     if(model->grads_memory != NULL) { memset(model->grads_memory, 0, model->num_parameters * sizeof(float)); }
     if(model->grads_acts_memory != NULL) { memset(model->grads_acts_memory, 0, model->num_activations * sizeof(float)); }
     if (model->alc_config.use_alc && model->alc.initialized) {
-        alc_zero_param_grads(&model->alc, model->config.channels, model->alc_config.alc_slot_dim);
+        alc_zero_param_grads(&model->alc, model->config.channels, model->alc_config.alc_slot_dim, model->alc_config.alc_key_dim);
     }
 }
 
@@ -1723,6 +1905,12 @@ void gpt2_update(GPT2 *model, float learning_rate, float beta1, float beta2, flo
     if (model->alc_config.use_alc && model->alc.initialized && model->alc.d_slot_to_hidden != NULL) {
         size_t C = model->config.channels;
         size_t D = model->alc_config.alc_slot_dim;
+        size_t K = model->alc_config.alc_key_dim;
+        if (model->alc_config.alc_routing_mode != ALC_ROUTING_HARD_TOP1) {
+            alc_adamw_update(model->alc.query_proj, model->alc.d_query_proj,
+                             model->alc.m_query_proj, model->alc.v_query_proj,
+                             K * C, learning_rate, beta1, beta2, eps, weight_decay, t);
+        }
         alc_adamw_update(model->alc.slot_to_hidden, model->alc.d_slot_to_hidden,
                          model->alc.m_slot_to_hidden, model->alc.v_slot_to_hidden,
                          C * D, learning_rate, beta1, beta2, eps, weight_decay, t);
@@ -1757,16 +1945,21 @@ void gpt2_free(GPT2 *model) {
     free(model->alc.query_buffer);
     free(model->alc.retrieved_buffer);
     free(model->alc.selected_slots);
+    free(model->alc.routing_probs);
     free(model->alc.slot_hit_counts);
     free(model->alc.hidden_pre_layers);
     free(model->alc.retrieved_layers);
     free(model->alc.selected_slots_layers);
+    free(model->alc.routing_probs_layers);
+    free(model->alc.d_query_proj);
     free(model->alc.d_slot_to_hidden);
     free(model->alc.d_gate_h);
     free(model->alc.d_gate_a);
     free(model->alc.d_gate_b);
     free(model->alc.m_slot_to_hidden);
     free(model->alc.v_slot_to_hidden);
+    free(model->alc.m_query_proj);
+    free(model->alc.v_query_proj);
     free(model->alc.m_gate_h);
     free(model->alc.v_gate_h);
     free(model->alc.m_gate_a);
@@ -1856,6 +2049,9 @@ int main() {
     alc_cfg.alc_update_mode = env_get_int("LLMC_ALC_UPDATE_MODE", alc_cfg.alc_update_mode);
     alc_cfg.alc_apply_every_n_layers = env_get_int("LLMC_ALC_APPLY_EVERY_N_LAYERS", alc_cfg.alc_apply_every_n_layers);
     alc_cfg.alc_additive_scale = env_get_float("LLMC_ALC_ADDITIVE_SCALE", alc_cfg.alc_additive_scale);
+    alc_cfg.alc_routing_mode = env_get_int("LLMC_ALC_ROUTING_MODE", alc_cfg.alc_routing_mode);
+    alc_cfg.alc_topk = env_get_int("LLMC_ALC_TOPK", alc_cfg.alc_topk);
+    alc_cfg.alc_temperature = env_get_float("LLMC_ALC_TEMPERATURE", alc_cfg.alc_temperature);
     gpt2_set_alc_config(&model, alc_cfg);
     model.alc.debug_enabled = env_get_int("LLMC_ALC_DEBUG", 0);
 
