@@ -309,6 +309,28 @@ The hardening suite adds finite-difference gradient checks (representative subse
 
 See `docs/adaptive_learning_component.md` for the full architecture/design notes and `docs/alc_change_log.md` for implementation-level change tracking.
 
+## experimental: MoE expert-local memory (`train_gpt2_moe_experimental.c`)
+
+This clone also includes a separate experimental CPU path with MoE + expert-local memory in `train_gpt2_moe_experimental.c`.
+
+Current milestone: **top-2 routed experts with weighted expert combination** and **expert-local weighted writes**.
+
+- Router picks top-k experts (`LLMC_MOE_TOPK`, default `2`) and normalizes selected weights with router temperature (`LLMC_MOE_ROUTER_TEMPERATURE`, default `1.0`).
+- Each selected expert runs its own FFN and its own local memory read/write path.
+- Final MoE output is the weighted sum of selected expert outputs.
+- Selected expert writes are scaled by router weights; non-selected experts are not updated.
+
+This path is currently **forward-only** for active MoE layers (backward intentionally rejects active MoE layers).
+
+Artifact-independent MoE validation:
+
+```bash
+gcc -Ofast -g -I. dev/test/moe_expert_memory.c -lm -o dev/test/moe_expert_memory
+./dev/test/moe_expert_memory
+```
+
+Design details and equations are in `docs/moe_expert_memory_design.md`.
+
 ## discussions
 
 Ways of organizing development:

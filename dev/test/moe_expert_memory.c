@@ -1,4 +1,4 @@
-// Artifact-independent unit tests for experimental top-1 MoE + expert-local memory.
+// Artifact-independent unit tests for experimental top-2 MoE + expert-local memory.
 #define TESTING
 #include "../../train_gpt2_moe_experimental.c"
 
@@ -28,91 +28,148 @@ static GPT2 make_test_model(int E, int C, int S, int D) {
     gpt2_build_from_synthetic(&model, cfg);
     model.moe_config.use_moe = 1;
     model.moe_config.moe_num_experts = E;
-    model.moe_config.moe_topk = 1;
+    model.moe_config.moe_topk = 2;
     model.moe_config.moe_apply_every_n_layers = 1;
     model.moe_config.moe_expert_memory_slots = S;
     model.moe_config.moe_expert_memory_dim = D;
     model.moe_config.moe_memory_update_rate = 0.5f;
     model.moe_config.moe_memory_fusion_scale = 1.0f;
-    gpt2_init_moe_state(&model, 1, 4);
+    model.moe_config.moe_router_temperature = 1.0f;
+    gpt2_init_moe_state(&model, 1, 8);
     reset_moe_weights(&model);
     return model;
 }
 
+static int approx(float a, float b, float tol) {
+    return fabsf(a - b) <= tol;
+}
+
 int main(void) {
     {
-        GPT2 model = make_test_model(2, 4, 2, 2);
-        // Route by sign of hidden[0].
-        model.moe.router_w[0 * 4 + 0] = 2.0f;
-        model.moe.router_w[1 * 4 + 0] = -2.0f;
+        GPT2 model = make_test_model(4, 4, 2, 2);
+        // Routing by hidden[0]: logits descend with expert id.
+        model.moe.router_w[0 * 4 + 0] = 3.0f;
+        model.moe.router_w[1 * 4 + 0] = 1.5f;
+        model.moe.router_w[2 * 4 + 0] = -1.0f;
+        model.moe.router_w[3 * 4 + 0] = -2.0f;
         float ln2[4 * 4] = {
             1,0,0,0,
-           -1,0,0,0,
+            2,0,0,0,
+            -1,0,0,0,
             3,0,0,0,
-           -2,0,0,0,
         };
         float out[4 * 4];
         memset(out, 0, sizeof(out));
-        moe_forward_top1_expert_local(&model, ln2, out, 1, 4, 4);
+        moe_forward_topk_expert_local(&model, ln2, out, 1, 4, 4);
         for (int bt = 0; bt < 4; bt++) {
-            assert(model.moe.selected_expert[bt] >= 0 && model.moe.selected_expert[bt] < 2);
+            int* sel = model.moe.selected_expert + bt * 2;
+            float* w = model.moe.selected_expert_weight + bt * 2;
+            assert(sel[0] >= 0 && sel[0] < 4);
+            assert(sel[1] >= 0 && sel[1] < 4);
+            assert(sel[0] != sel[1]);
+            assert(approx(w[0] + w[1], 1.0f, 1e-5f));
+            assert(w[0] >= 0.0f && w[1] >= 0.0f);
         }
         gpt2_free(&model);
     }
 
     {
-        GPT2 model = make_test_model(2, 4, 2, 2);
-        // Force expert selection via router bias and give distinct expert outputs.
-        model.moe.router_b[0] = 5.0f;
-        model.moe.expert_fcprojb[0 * 4 + 0] = 1.0f;
+        GPT2 model = make_test_model(3, 4, 1, 1);
+        model.moe_config.moe_memory_fusion_scale = 0.0f; // isolate weighted expert output combine
+
+        // Constant per-expert outputs through fcproj biases.
+        model.moe.expert_fcprojb[0 * 4 + 0] = 10.0f;
+        model.moe.expert_fcprojb[1 * 4 + 0] = -6.0f;
+        model.moe.expert_fcprojb[2 * 4 + 0] = 100.0f; // should never contribute when not selected
+
         float ln2[4] = {0};
         float out_a[4] = {0};
-        moe_forward_top1_expert_local(&model, ln2, out_a, 1, 1, 4);
-        assert(model.moe.selected_expert[0] == 0);
-
-        model.moe.router_b[0] = -5.0f;
-        model.moe.router_b[1] = 5.0f;
-        model.moe.expert_fcprojb[1 * 4 + 0] = -3.0f;
         float out_b[4] = {0};
-        moe_forward_top1_expert_local(&model, ln2, out_b, 1, 1, 4);
-        assert(model.moe.selected_expert[0] == 1);
-        assert(out_a[0] != out_b[0]); // experts differ on same input
+        float out_c[4] = {0};
+
+        // Case A: expert 0 favored over expert 1.
+        model.moe.router_b[0] = 3.0f;
+        model.moe.router_b[1] = 2.0f;
+        model.moe.router_b[2] = -10.0f;
+        moe_forward_topk_expert_local(&model, ln2, out_a, 1, 1, 4);
+        int* sel_a = model.moe.selected_expert;
+        assert((sel_a[0] == 0 || sel_a[1] == 0) && (sel_a[0] == 1 || sel_a[1] == 1));
+
+        // Case B: flip preference; output must change.
+        model.moe.router_b[0] = 2.0f;
+        model.moe.router_b[1] = 3.0f;
+        model.moe.router_b[2] = -10.0f;
+        moe_forward_topk_expert_local(&model, ln2, out_b, 1, 1, 4);
+        assert(!approx(out_a[0], out_b[0], 1e-4f));
+
+        // Case C: expert 0 dominates strongly.
+        model.moe.router_b[0] = 8.0f;
+        model.moe.router_b[1] = 1.0f;
+        model.moe.router_b[2] = -10.0f;
+        moe_forward_topk_expert_local(&model, ln2, out_c, 1, 1, 4);
+        assert(fabsf(out_c[0] - 10.0f) < 0.05f);
+
+        // Non-selected expert (2) does not contribute despite huge bias output.
+        assert(fabsf(out_a[0]) < 20.0f);
+        assert(fabsf(out_b[0]) < 20.0f);
+        assert(fabsf(out_c[0]) < 20.0f);
+
         gpt2_free(&model);
     }
 
     {
-        GPT2 model = make_test_model(2, 4, 2, 2);
-        // Read-path activation: memory contributes to output.
-        model.moe.router_b[0] = 3.0f;
-        model.moe.memory_slot_to_hidden[(0 * 4 + 0) * 2 + 0] = 1.0f; // c0 <- d0
-        model.moe.expert_memory[(0 * 2 + 0) * 2 + 0] = 4.0f;         // slot0,d0
-        model.moe.expert_memory_keys[(0 * 2 + 0) * 2 + 0] = 1.0f;
-        model.moe.memory_query_proj[(0 * 2 + 0) * 4 + 0] = 1.0f;      // q0 <- u0
-        model.moe.expert_fcprojb[0 * 4 + 0] = 2.0f;                   // u0 = 2
-        float ln2[4] = {0};
-        float out[4] = {0};
-        moe_forward_top1_expert_local(&model, ln2, out, 1, 1, 4);
-        assert(out[0] > 2.0f); // fused with memory read
+        GPT2 model = make_test_model(3, 2, 1, 1);
+        model.moe_config.moe_memory_update_rate = 0.5f;
+        model.moe_config.moe_memory_fusion_scale = 0.0f;
 
-        // Write-path isolation: selected expert mutates, other expert unchanged.
-        float other_before = model.moe.expert_memory[(1 * 2 + 0) * 2 + 0];
-        float self_before = model.moe.expert_memory[(0 * 2 + 0) * 2 + 0];
-        model.moe.memory_write_proj[(0 * 2 + 0) * 4 + 0] = 1.0f;
-        moe_forward_top1_expert_local(&model, ln2, out, 1, 1, 4);
-        float other_after = model.moe.expert_memory[(1 * 2 + 0) * 2 + 0];
-        float self_after = model.moe.expert_memory[(0 * 2 + 0) * 2 + 0];
-        assert(other_before == other_after);
-        assert(self_before != self_after);
-
-        // Repeated writes still must not mutate non-selected expert.
-        for (int i = 0; i < 8; i++) {
-            moe_forward_top1_expert_local(&model, ln2, out, 1, 1, 4);
+        // Make u[0] = 2 for all experts, and write[d0] = u[0].
+        for (int e = 0; e < 3; e++) {
+            model.moe.expert_fcprojb[e * 2 + 0] = 2.0f;
+            model.moe.memory_write_proj[(e * 1 + 0) * 2 + 0] = 1.0f;
+            model.moe.memory_query_proj[(e * 1 + 0) * 2 + 0] = 1.0f;
+            model.moe.expert_memory_keys[(e * 1 + 0) * 1 + 0] = 1.0f;
         }
-        assert(model.moe.expert_memory[(1 * 2 + 1) * 2 + 1] == 0.0f);
-        for (int i = 0; i < 4; i++) { assert(isfinite(out[i])); }
+
+        float ln2[2] = {0};
+        float out[2] = {0};
+
+        // First pass: experts 0 and 1 selected, expert 2 unselected.
+        model.moe.router_b[0] = 3.0f;
+        model.moe.router_b[1] = 2.0f;
+        model.moe.router_b[2] = -10.0f;
+        moe_forward_topk_expert_local(&model, ln2, out, 1, 1, 2);
+        float mem0_a = model.moe.expert_memory[(0 * 1 + 0) * 1 + 0];
+        float mem1_a = model.moe.expert_memory[(1 * 1 + 0) * 1 + 0];
+        float mem2_a = model.moe.expert_memory[(2 * 1 + 0) * 1 + 0];
+        assert(mem0_a > 0.0f && mem1_a > 0.0f);
+        assert(approx(mem2_a, 0.0f, 1e-7f));
+
+        // Reset memory and rerun with reversed router preference to verify weighted write scaling.
+        model.moe.expert_memory[(0 * 1 + 0) * 1 + 0] = 0.0f;
+        model.moe.expert_memory[(1 * 1 + 0) * 1 + 0] = 0.0f;
+        model.moe.expert_memory[(2 * 1 + 0) * 1 + 0] = 0.0f;
+        model.moe.router_b[0] = 1.0f;
+        model.moe.router_b[1] = 4.0f;
+        model.moe.router_b[2] = -10.0f;
+        moe_forward_topk_expert_local(&model, ln2, out, 1, 1, 2);
+        float mem0_b = model.moe.expert_memory[(0 * 1 + 0) * 1 + 0];
+        float mem1_b = model.moe.expert_memory[(1 * 1 + 0) * 1 + 0];
+        float mem2_b = model.moe.expert_memory[(2 * 1 + 0) * 1 + 0];
+        assert(mem1_b > mem0_b); // higher router weight => larger write magnitude
+        assert(approx(mem2_b, 0.0f, 1e-7f));
+
+        // Finite/stable forward behavior over repeated writes.
+        for (int i = 0; i < 32; i++) {
+            moe_forward_topk_expert_local(&model, ln2, out, 1, 1, 2);
+            assert(isfinite(out[0]) && isfinite(out[1]));
+            for (int e = 0; e < 3; e++) {
+                assert(isfinite(model.moe.expert_memory[(e * 1 + 0) * 1 + 0]));
+            }
+        }
+
         gpt2_free(&model);
     }
 
-    printf("moe_expert_memory tests passed\n");
+    printf("moe_expert_memory top-2 tests passed\n");
     return 0;
 }
