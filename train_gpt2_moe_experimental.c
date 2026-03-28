@@ -570,15 +570,24 @@ typedef struct {
 typedef struct {
     float* router_w; // (E, C)
     float* router_b; // (E)
+    float* expert_fcw; // (E, 4*C, C)
+    float* expert_fcb; // (E, 4*C)
+    float* expert_fcprojw; // (E, C, 4*C)
+    float* expert_fcprojb; // (E, C)
     float* expert_memory; // (E, S, D)
     float* expert_memory_keys; // (E, S, D)
+    float* memory_query_proj; // (E, D, C)
+    float* memory_write_proj; // (E, D, C)
+    float* memory_slot_to_hidden; // (E, C, D)
     float* router_logits; // (B*T, E)
     float* router_probs; // (B*T, E)
+    float* memory_probs; // (B*T, S), selected expert local routing probs
     int* selected_expert; // (B*T)
     float* retrieved_buffer; // (B*T, C)
     int initialized;
     int scratch_bt;
     int logged_enable_message;
+    int debug_enabled;
 } MoEState;
 
 typedef struct {
@@ -860,10 +869,12 @@ static void gpt2_init_moe_state(GPT2* model, int B, int T) {
         if (model->moe.scratch_bt != BT) {
             free(model->moe.router_logits);
             free(model->moe.router_probs);
+            free(model->moe.memory_probs);
             free(model->moe.selected_expert);
             free(model->moe.retrieved_buffer);
             model->moe.router_logits = (float*)mallocCheck((size_t)BT * E * sizeof(float));
             model->moe.router_probs = (float*)mallocCheck((size_t)BT * E * sizeof(float));
+            model->moe.memory_probs = (float*)mallocCheck((size_t)BT * S * sizeof(float));
             model->moe.selected_expert = (int*)mallocCheck((size_t)BT * sizeof(int));
             model->moe.retrieved_buffer = (float*)mallocCheck((size_t)BT * C * sizeof(float));
             model->moe.scratch_bt = BT;
@@ -874,20 +885,35 @@ static void gpt2_init_moe_state(GPT2* model, int B, int T) {
     #define MOE_NEXT_RAND() (seed ^= seed << 7, seed ^= seed >> 9, ((seed & 0xFFFFFF) / (float)0x1000000))
     model->moe.router_w = (float*)mallocCheck((size_t)E * C * sizeof(float));
     model->moe.router_b = (float*)calloc((size_t)E, sizeof(float));
+    model->moe.expert_fcw = (float*)mallocCheck((size_t)E * (4 * C) * C * sizeof(float));
+    model->moe.expert_fcb = (float*)calloc((size_t)E * (4 * C), sizeof(float));
+    model->moe.expert_fcprojw = (float*)mallocCheck((size_t)E * C * (4 * C) * sizeof(float));
+    model->moe.expert_fcprojb = (float*)calloc((size_t)E * C, sizeof(float));
     model->moe.expert_memory = (float*)calloc((size_t)E * S * D, sizeof(float));
     model->moe.expert_memory_keys = (float*)mallocCheck((size_t)E * S * D * sizeof(float));
+    model->moe.memory_query_proj = (float*)mallocCheck((size_t)E * D * C * sizeof(float));
+    model->moe.memory_write_proj = (float*)mallocCheck((size_t)E * D * C * sizeof(float));
+    model->moe.memory_slot_to_hidden = (float*)mallocCheck((size_t)E * C * D * sizeof(float));
     model->moe.router_logits = (float*)mallocCheck((size_t)BT * E * sizeof(float));
     model->moe.router_probs = (float*)mallocCheck((size_t)BT * E * sizeof(float));
+    model->moe.memory_probs = (float*)mallocCheck((size_t)BT * S * sizeof(float));
     model->moe.selected_expert = (int*)mallocCheck((size_t)BT * sizeof(int));
     model->moe.retrieved_buffer = (float*)mallocCheck((size_t)BT * C * sizeof(float));
     for (int i = 0; i < E * C; i++) { model->moe.router_w[i] = (MOE_NEXT_RAND() * 2.0f - 1.0f) * 0.02f; }
+    for (int i = 0; i < E * (4 * C) * C; i++) { model->moe.expert_fcw[i] = (MOE_NEXT_RAND() * 2.0f - 1.0f) * 0.02f; }
+    for (int i = 0; i < E * C * (4 * C); i++) { model->moe.expert_fcprojw[i] = (MOE_NEXT_RAND() * 2.0f - 1.0f) * 0.02f; }
     for (int i = 0; i < E * S * D; i++) { model->moe.expert_memory_keys[i] = (MOE_NEXT_RAND() * 2.0f - 1.0f) * 0.02f; }
+    for (int i = 0; i < E * D * C; i++) {
+        model->moe.memory_query_proj[i] = (MOE_NEXT_RAND() * 2.0f - 1.0f) * 0.02f;
+        model->moe.memory_write_proj[i] = (MOE_NEXT_RAND() * 2.0f - 1.0f) * 0.02f;
+    }
+    for (int i = 0; i < E * C * D; i++) { model->moe.memory_slot_to_hidden[i] = (MOE_NEXT_RAND() * 2.0f - 1.0f) * 0.02f; }
     model->moe.initialized = 1;
     model->moe.scratch_bt = BT;
     #undef MOE_NEXT_RAND
 }
 
-static void moe_forward_memory_scaffold(GPT2* model, float* l_ln2, float* l_fcproj, int B, int T, int C) {
+static void moe_forward_top1_expert_local(GPT2* model, float* l_ln2, float* l_fcproj, int B, int T, int C) {
     if (!model->moe_config.use_moe) { return; }
     int BT = B * T;
     int E = model->moe_config.moe_num_experts;
@@ -895,6 +921,7 @@ static void moe_forward_memory_scaffold(GPT2* model, float* l_ln2, float* l_fcpr
     int D = model->moe_config.moe_expert_memory_dim;
     float alpha = model->moe_config.moe_memory_update_rate;
     float scale = model->moe_config.moe_memory_fusion_scale;
+    float inv_sqrt_d = 1.0f / sqrtf((float)D);
 
     for (int bt = 0; bt < BT; bt++) {
         const float* h = l_ln2 + (size_t)bt * C;
@@ -917,25 +944,95 @@ static void moe_forward_memory_scaffold(GPT2* model, float* l_ln2, float* l_fcpr
         float inv_sum = sum_exp > 0.0f ? 1.0f / sum_exp : 0.0f;
         for (int e = 0; e < E; e++) { probs[e] *= inv_sum; }
         model->moe.selected_expert[bt] = expert;
+        assert(expert >= 0 && expert < E);
 
-        const float* q = l_fcproj + (size_t)bt * C;
-        float* retrieved = model->moe.retrieved_buffer + (size_t)bt * C;
-        memset(retrieved, 0, (size_t)C * sizeof(float));
+        // Architecture for selected expert i:
+        // h -> FFN_i -> u_i -> memory_i read/write -> fuse(u_i, memory_i) -> output.
+        float fch[4 * C];
+        float u[C];
+        const float* fcw = model->moe.expert_fcw + (size_t)expert * (4 * C) * C;
+        const float* fcb = model->moe.expert_fcb + (size_t)expert * (4 * C);
+        const float* fcprojw = model->moe.expert_fcprojw + (size_t)expert * C * (4 * C);
+        const float* fcprojb = model->moe.expert_fcprojb + (size_t)expert * C;
+        for (int o = 0; o < 4 * C; o++) {
+            float acc = fcb[o];
+            const float* wrow = fcw + (size_t)o * C;
+            for (int c = 0; c < C; c++) { acc += wrow[c] * h[c]; }
+            float cube = 0.044715f * acc * acc * acc;
+            float inner = 0.7978845608f * (acc + cube);
+            fch[o] = 0.5f * acc * (1.0f + tanhf(inner));
+        }
+        for (int o = 0; o < C; o++) {
+            float acc = fcprojb[o];
+            const float* wrow = fcprojw + (size_t)o * (4 * C);
+            for (int i = 0; i < 4 * C; i++) { acc += wrow[i] * fch[i]; }
+            u[o] = acc;
+        }
 
-        int best_slot = 0;
-        float best_score = -FLT_MAX;
+        const float* qproj = model->moe.memory_query_proj + (size_t)expert * D * C;
+        const float* wproj = model->moe.memory_write_proj + (size_t)expert * D * C;
+        const float* slot_to_hidden = model->moe.memory_slot_to_hidden + (size_t)expert * C * D;
+        float query[D];
+        float write[D];
+        for (int d = 0; d < D; d++) {
+            float qacc = 0.0f;
+            float wacc = 0.0f;
+            const float* qrow = qproj + (size_t)d * C;
+            const float* wrow = wproj + (size_t)d * C;
+            for (int c = 0; c < C; c++) {
+                qacc += qrow[c] * u[c];
+                wacc += wrow[c] * u[c];
+            }
+            query[d] = qacc;
+            write[d] = wacc;
+        }
+
+        float* mem_probs = model->moe.memory_probs + (size_t)bt * S;
+        float max_score = -FLT_MAX;
         for (int s = 0; s < S; s++) {
             const float* key = model->moe.expert_memory_keys + ((size_t)expert * S + s) * D;
             float score = 0.0f;
-            for (int d = 0; d < D; d++) { score += q[d] * key[d]; }
-            if (score > best_score) { best_score = score; best_slot = s; }
+            for (int d = 0; d < D; d++) { score += query[d] * key[d]; }
+            score *= inv_sqrt_d;
+            mem_probs[s] = score;
+            if (score > max_score) { max_score = score; }
+        }
+        float mem_sum = 0.0f;
+        for (int s = 0; s < S; s++) {
+            mem_probs[s] = expf(mem_probs[s] - max_score);
+            mem_sum += mem_probs[s];
+        }
+        float inv_mem_sum = mem_sum > 0.0f ? 1.0f / mem_sum : 0.0f;
+        for (int s = 0; s < S; s++) { mem_probs[s] *= inv_mem_sum; }
+
+        float mem_read[D];
+        memset(mem_read, 0, (size_t)D * sizeof(float));
+        for (int s = 0; s < S; s++) {
+            float p = mem_probs[s];
+            const float* mem = model->moe.expert_memory + ((size_t)expert * S + s) * D;
+            for (int d = 0; d < D; d++) { mem_read[d] += p * mem[d]; }
+        }
+        float* retrieved = model->moe.retrieved_buffer + (size_t)bt * C;
+        for (int c = 0; c < C; c++) {
+            float mh = 0.0f;
+            const float* mrow = slot_to_hidden + (size_t)c * D;
+            for (int d = 0; d < D; d++) { mh += mrow[d] * mem_read[d]; }
+            retrieved[c] = mh;
+            l_fcproj[(size_t)bt * C + c] = u[c] + scale * mh;
         }
 
-        float* mem = model->moe.expert_memory + ((size_t)expert * S + best_slot) * D;
-        for (int d = 0; d < D; d++) {
-            retrieved[d] = mem[d];
-            l_fcproj[(size_t)bt * C + d] += scale * retrieved[d];
-            mem[d] = (1.0f - alpha) * mem[d] + alpha * q[d];
+        for (int s = 0; s < S; s++) {
+            float p = mem_probs[s];
+            float* mem = model->moe.expert_memory + ((size_t)expert * S + s) * D;
+            float* key = model->moe.expert_memory_keys + ((size_t)expert * S + s) * D;
+            for (int d = 0; d < D; d++) {
+                mem[d] = (1.0f - alpha) * mem[d] + alpha * p * write[d];
+                key[d] = (1.0f - alpha) * key[d] + alpha * p * query[d];
+            }
+        }
+
+        if (model->moe.debug_enabled && bt < 4) {
+            fprintf(stderr, "[MoE-debug] bt=%d expert=%d router_p=%.4f\n", bt, expert, probs[expert]);
         }
     }
 }
@@ -1809,14 +1906,15 @@ void gpt2_forward(GPT2 *model, int* inputs, int* targets, size_t B, size_t T) {
     if (model->moe_config.use_moe) {
         gpt2_init_moe_state(model, B, T);
         if (!model->moe.logged_enable_message) {
-            printf("[MoE-experimental] enabled: experts=%d topk=%d memory_slots=%d memory_dim=%d update_rate=%.4f fusion_scale=%.4f apply_every_n_layers=%d\n",
+            printf("[MoE-experimental] enabled: experts=%d topk=%d memory_slots=%d memory_dim=%d update_rate=%.4f fusion_scale=%.4f apply_every_n_layers=%d debug=%d\n",
                    model->moe_config.moe_num_experts,
                    model->moe_config.moe_topk,
                    model->moe_config.moe_expert_memory_slots,
                    model->moe_config.moe_expert_memory_dim,
                    model->moe_config.moe_memory_update_rate,
                    model->moe_config.moe_memory_fusion_scale,
-                   model->moe_config.moe_apply_every_n_layers);
+                   model->moe_config.moe_apply_every_n_layers,
+                   model->moe.debug_enabled);
             model->moe.logged_enable_message = 1;
         }
     }
@@ -1891,11 +1989,18 @@ void gpt2_forward(GPT2 *model, int* inputs, int* targets, size_t B, size_t T) {
         matmul_forward(l_attproj, l_atty, l_attprojw, l_attprojb, B, T, C, C);
         residual_forward(l_residual2, residual, l_attproj, B*T*C);
         layernorm_forward(l_ln2, l_ln2_mean, l_ln2_rstd, l_residual2, l_ln2w, l_ln2b, B, T, C);
-        matmul_forward(l_fch, l_ln2, l_fcw, l_fcb, B, T, C, 4*C);
-        gelu_forward(l_fch_gelu, l_fch, B*T*4*C);
-        matmul_forward(l_fcproj, l_fch_gelu, l_fcprojw, l_fcprojb, B, T, 4*C, C);
         if (moe_layer_enabled(model, l)) {
-            moe_forward_memory_scaffold(model, l_ln2, l_fcproj, B, T, C);
+            // Minimal top-1 MoE block placement:
+            // LN -> router -> selected expert FFN -> selected expert memory -> fuse -> residual.
+            // Future extension points:
+            // - top-k expert combine can replace this call
+            // - global ALC remains after residual as a separate optional module
+            // - Engram-like global memory can be inserted after expert fusion
+            moe_forward_top1_expert_local(model, l_ln2, l_fcproj, B, T, C);
+        } else {
+            matmul_forward(l_fch, l_ln2, l_fcw, l_fcb, B, T, C, 4*C);
+            gelu_forward(l_fch_gelu, l_fch, B*T*4*C);
+            matmul_forward(l_fcproj, l_fch_gelu, l_fcprojw, l_fcprojb, B, T, 4*C, C);
         }
         residual_forward(l_residual3, l_residual2, l_fcproj, B*T*C);
         // post-FFN extension region ordering (future intent):
@@ -1960,6 +2065,15 @@ void gpt2_backward(GPT2 *model) {
     if (model->mean_loss == -1.0f) {
         printf("Error: must forward with targets before backward\n");
         exit(1);
+    }
+    if (model->moe_config.use_moe) {
+        for (int l = 0; l < model->config.num_layers; l++) {
+            if (moe_layer_enabled(model, l)) {
+                fprintf(stderr, "Error: gpt2_backward does not yet support MoE expert parameters in experimental path.\n");
+                fprintf(stderr, "Run forward-only MoE tests or disable MoE for training/backward.\n");
+                exit(1);
+            }
+        }
     }
 
     // lazily allocate the memory for gradients of the weights and activations, if needed
@@ -2161,10 +2275,18 @@ void gpt2_free(GPT2 *model) {
     free(model->alc.v_gate_b);
     free(model->moe.router_w);
     free(model->moe.router_b);
+    free(model->moe.expert_fcw);
+    free(model->moe.expert_fcb);
+    free(model->moe.expert_fcprojw);
+    free(model->moe.expert_fcprojb);
     free(model->moe.expert_memory);
     free(model->moe.expert_memory_keys);
+    free(model->moe.memory_query_proj);
+    free(model->moe.memory_write_proj);
+    free(model->moe.memory_slot_to_hidden);
     free(model->moe.router_logits);
     free(model->moe.router_probs);
+    free(model->moe.memory_probs);
     free(model->moe.selected_expert);
     free(model->moe.retrieved_buffer);
 }
@@ -2263,6 +2385,7 @@ int main() {
     model.moe_config.moe_expert_memory_dim = env_get_int("LLMC_MOE_EXPERT_MEMORY_DIM", model.moe_config.moe_expert_memory_dim);
     model.moe_config.moe_memory_update_rate = env_get_float("LLMC_MOE_MEMORY_UPDATE_RATE", model.moe_config.moe_memory_update_rate);
     model.moe_config.moe_memory_fusion_scale = env_get_float("LLMC_MOE_MEMORY_FUSION_SCALE", model.moe_config.moe_memory_fusion_scale);
+    model.moe.debug_enabled = env_get_int("LLMC_MOE_DEBUG", 0);
 
     // build the DataLoaders from tokens files. for now use tiny_shakespeare if available, else tiny_stories
     const char* tiny_stories_train = "dev/data/tinystories/TinyStories_train.bin";
