@@ -313,14 +313,15 @@ See `docs/adaptive_learning_component.md` for the full architecture/design notes
 
 This clone also includes a separate experimental CPU path with MoE + expert-local memory in `train_gpt2_moe_experimental.c`.
 
-Current milestone: **top-2 routed experts with weighted expert combination** and **expert-local weighted writes**.
+Current milestone: **top-2 routed experts with real backward/training support** and **expert-local weighted writes**.
 
 - Router picks top-k experts (`LLMC_MOE_TOPK`, default `2`) and normalizes selected weights with router temperature (`LLMC_MOE_ROUTER_TEMPERATURE`, default `1.0`).
 - Each selected expert runs its own FFN and its own local memory read/write path.
 - Final MoE output is the weighted sum of selected expert outputs.
+- Backward now propagates through weighted top-2 combine and selected-softmax router weights.
+- Selected expert FFN params and router params now receive gradients and optimizer updates; non-selected experts remain zero-gradient for that token.
 - Selected expert writes are scaled by router weights; non-selected experts are not updated.
-
-This path is currently **forward-only** for active MoE layers (backward intentionally rejects active MoE layers).
+- Expert-local memory writes remain stateful EMA updates in this milestone.
 
 Artifact-independent MoE validation:
 

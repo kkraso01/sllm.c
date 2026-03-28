@@ -1,174 +1,147 @@
 # MoE Expert-Local Memory Design (Experimental Path)
 
-## Stage 1 audit of `train_gpt2_moe_experimental.c` (before this top-2 pass)
+## Stage 1 audit of `train_gpt2_moe_experimental.c` (before this training pass)
 
-Before this pass, the experimental MoE path already had a real top-1 expert-local forward path:
+This audit captures what existed immediately before enabling MoE backward/training:
 
-- Router computed per-expert logits and picked a single argmax expert.
-- Selected expert owned its own FFN parameters and local memory tensors.
-- Selected expert read/wrote only its own memory bank.
-- Non-selected experts were untouched.
-- Backward/training for active MoE layers was intentionally blocked in `gpt2_backward`.
+- **Fail-fast location:** `gpt2_backward` exited when it detected an active MoE layer (`moe_layer_enabled(model, l)`), so no MoE gradients were computed/applied.
+- **Forward caches already available:** per-token router logits/probs, selected expert ids, selected expert weights, and per-selected-expert memory routing probs were already stored in `MoEState` scratch buffers.
+- **Missing gradient ownership:** MoE parameters (`router_*`, `expert_fc*`) had no dedicated gradient buffers or optimizer moments.
+- **Optimizer gap:** `gpt2_update` updated dense GPT-2 params (+ optional ALC tensors), but not MoE router/expert tensors.
 
-What needed to change for this milestone:
-
-- replace top-1 selection with top-2 routing and normalized selected-expert weights
-- run both selected experts each token
-- weighted-combine selected expert outputs
-- scale each selected expert memory write coherently by its router weight
-- strengthen tests for top-2 validity, contribution, and isolation
+The goal of this pass was to replace that fail-fast with minimum-correct top-2 MoE training support.
 
 ---
 
-## Implemented top-2 block order (current experimental state)
+## Preserved forward architecture
 
-For MoE-enabled layers in `train_gpt2_moe_experimental.c`:
+For MoE-enabled layers:
 
 1. LN1 -> attention -> residual
 2. LN2
 3. Router logits over experts
-4. Select top-k experts (`k=moe_topk`, top-2 by default)
-5. For each selected expert `i`:
-   - `FFN_i(h) -> u_i`
-   - local memory read in expert `i`
-   - fuse expert compute + expert memory
-   - local memory write in expert `i`
-6. Weighted combine selected expert outputs
+4. Top-k selected experts (`k=2` default)
+5. For each selected expert: FFN -> expert-local memory read/write -> fuse
+6. Weighted combine of selected expert outputs
 7. Residual add
-8. Optional ALC remains after residual (unchanged)
+8. Optional global ALC path remains separate (unchanged)
 
-No global ALC was moved into the MoE path in this pass.
-
----
-
-## Router math (implemented now)
-
-Given token hidden state `h` and expert logits:
-
-\[
-r_i = w_i^{router} \cdot h + b_i^{router}
-\]
-
-Select top-k set \(\mathcal{E}=\text{TopK}(r,k)\) (`k=2` default).
-
-Router weights over selected experts use stable selected-softmax with temperature \(\tau>0\):
-
-\[
-\alpha_i =
-\begin{cases}
-\frac{\exp((r_i-r_{\max})/\tau)}{\sum_{j\in\mathcal{E}}\exp((r_j-r_{\max})/\tau)} & i\in\mathcal{E} \\
-0 & i\notin\mathcal{E}
-\end{cases}
-\]
-
-Notes:
-
-- `moe_topk` is validated with `1 <= moe_topk <= moe_num_experts`.
-- `moe_router_temperature` is validated with `> 0`.
-- Full router softmax over all experts is still stored in `router_probs` for diagnostics.
-- Selected indices and selected weights are stored per token in `(B*T, K)` buffers.
+No architectural expansion was added here.
 
 ---
 
-## Selected-expert compute + combine math (implemented now)
+## Backward math now implemented
 
-For each selected expert \(i\in\mathcal{E}\):
+### 1) Weighted top-2 combine backward
 
-\[
-u_i = \text{FFN}_i(h)
-\]
-
-\[
-m_i = \text{ExpertMemoryRead}_i(u_i)
-\]
-
-\[
-o_i = u_i + \lambda\,m_i^h
-\]
-
-where \(\lambda = \texttt{moe\_memory\_fusion\_scale}\).
-
-Final MoE output:
-
+Forward:
 \[
 o = \sum_{i\in\mathcal{E}} \alpha_i o_i
 \]
 
-This is the actual forward path now used in MoE-enabled layers.
+Backward:
+\[
+\frac{\partial L}{\partial o_i} = \alpha_i\frac{\partial L}{\partial o}
+\]
+\[
+\frac{\partial L}{\partial \alpha_i} = \left\langle \frac{\partial L}{\partial o}, o_i \right\rangle
+\]
+
+Implemented explicitly for selected experts only.
+
+### 2) Selected-softmax router backward
+
+Selected router weights:
+\[
+\alpha_i = \frac{\exp(r_i/\tau)}{\sum_{j\in\mathcal{E}}\exp(r_j/\tau)}
+\]
+
+For selected experts:
+\[
+\frac{\partial L}{\partial r_i} = \alpha_i\left(\frac{\partial L}{\partial \alpha_i} - \sum_{j\in\mathcal{E}}\alpha_j\frac{\partial L}{\partial \alpha_j}\right)\frac{1}{\tau}
+\]
+
+Then router param grads:
+\[
+\frac{\partial L}{\partial w_i^{router}} = \frac{\partial L}{\partial r_i} h,
+\quad
+\frac{\partial L}{\partial b_i^{router}} = \frac{\partial L}{\partial r_i}
+\]
+
+### 3) Selected expert FFN backward
+
+For each selected expert only, gradients are computed for:
+
+- `expert_fcw`
+- `expert_fcb`
+- `expert_fcprojw`
+- `expert_fcprojb`
+
+Non-selected experts receive zero MoE FFN gradients for that token.
+
+### 4) Memory-read gradient participation
+
+Memory writes remain **stateful EMA updates** (not differentiated through write updates).
+
+Memory **read** contribution in expert output still contributes to gradient flow into selected expert `u_i` through local query->memory-attention->read path (with memory state treated as fixed state for this step).
 
 ---
 
-## Expert-local memory ownership and write semantics (implemented now)
+## Trainable now vs stateful/fixed now
 
-Each expert owns distinct local tensors/state:
+### Trainable in this pass
 
-- FFN params (`expert_fcw`, `expert_fcb`, `expert_fcprojw`, `expert_fcprojb`)
-- memory state (`expert_memory`, `expert_memory_keys`)
-- memory projections (`memory_query_proj`, `memory_write_proj`, `memory_slot_to_hidden`)
+- Router params: `router_w`, `router_b`
+- Selected expert FFN params: `expert_fcw`, `expert_fcb`, `expert_fcprojw`, `expert_fcprojb`
 
-For selected expert \(i\), slot routing stays local and softmax-based over that expert’s slots:
+These now have:
 
-\[
-q_i = W_i^q u_i,\quad
-w_i = W_i^w u_i
-\]
+- dedicated gradient buffers
+- AdamW moment buffers
+- update integration in `gpt2_update`
 
-\[
-p_{is} = \text{softmax}_s\left(\frac{q_i\cdot k_{is}}{\sqrt{D}}\right)
-\]
+### Stateful EMA (not backpropagated through write updates)
 
-\[
-m_i = \sum_s p_{is} v_{is}
-\]
+- `expert_memory`
+- `expert_memory_keys`
 
-Weighted write semantics for top-2 are implemented via an effective update rate
-\(\alpha_i^{eff} = \alpha\,\alpha_i\):
+### Fixed (this pass)
 
-\[
-v_{is} \leftarrow (1-\alpha_i^{eff})v_{is} + \alpha_i^{eff} p_{is} w_i
-\]
-\[
-k_{is} \leftarrow (1-\alpha_i^{eff})k_{is} + \alpha_i^{eff} p_{is} q_i
-\]
-
-This preserves:
-
-- selected experts write only to their own local memory
-- non-selected experts are not touched
-- write magnitude scales with router selection weight
+- `memory_query_proj`, `memory_write_proj`, `memory_slot_to_hidden` remain unchanged by optimizer in this milestone.
 
 ---
 
-## Why top-2 before global ALC integration
+## Why training support comes before load balancing
 
-Top-2 is the correct next milestone because it validates core sparse-MoE behavior first:
+Load balancing is only meaningful once the routed path is demonstrably learnable.
 
-- sparse multi-expert routing correctness
-- weighted expert output mixing
-- concurrent expert-local memory updates with isolation
+This pass establishes that:
 
-Without this, adding global ALC would blur ownership boundaries and make debugging attribution harder. Top-2 expert-local behavior must be correct and testable before introducing cross-expert/global memory interactions.
+- selected experts receive gradients and updates,
+- non-selected experts remain isolated,
+- router parameters receive gradients and update,
+- forward behavior changes after optimizer steps.
+
+With those fundamentals in place, auxiliary balancing losses can be added on a correct training substrate instead of masking routing/backward bugs.
 
 ---
 
-## Implemented now vs deferred
+## Current status (implemented now)
 
-### Implemented now
+- MoE-enabled layers no longer fail-fast in `gpt2_backward`.
+- Top-2 weighted-combine backward is implemented.
+- Selected-softmax router backward is implemented.
+- Selected expert FFN backward is implemented with isolation.
+- MoE router + expert FFN params are integrated into AdamW updates.
+- Artifact-independent tests now cover gradient/update isolation and post-step behavior change.
 
-- Top-k router path with top-2 default in experimental MoE config.
-- Stable selected-expert softmax weighting with router temperature.
-- Two-expert forward execution and weighted output combine.
-- Expert-local weighted writes for selected experts only.
-- Extended artifact-independent tests for routing validity, normalization, output contribution, write isolation, and finite forward stability.
+## Deferred (explicitly not in this pass)
 
-### Deferred (explicitly not in this pass)
-
-- MoE backward/optimizer support for expert params and router params.
-- Load-balancing / auxiliary routing losses.
-- Distributed MoE and production checkpointing of expert tensors.
-- Global ALC integration into MoE internals.
-
-Backward status remains unchanged: active MoE layers intentionally fail fast in `gpt2_backward`.
+- Load-balancing / auxiliary routing loss
+- Distributed MoE
+- Production checkpointing of MoE tensors
+- Pulling global ALC into MoE internals
+- Full differentiation through stateful EMA writes
 
 ---
 

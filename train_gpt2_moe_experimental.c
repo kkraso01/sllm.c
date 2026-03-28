@@ -587,6 +587,26 @@ typedef struct {
     int* selected_expert; // (B*T, K)
     float* selected_expert_weight; // (B*T, K)
     float* retrieved_buffer; // (B*T, C)
+    // trainable gradient buffers
+    float* d_router_w; // (E, C)
+    float* d_router_b; // (E)
+    float* d_expert_fcw; // (E, 4*C, C)
+    float* d_expert_fcb; // (E, 4*C)
+    float* d_expert_fcprojw; // (E, C, 4*C)
+    float* d_expert_fcprojb; // (E, C)
+    // AdamW moments for trainable MoE params
+    float* m_router_w;
+    float* v_router_w;
+    float* m_router_b;
+    float* v_router_b;
+    float* m_expert_fcw;
+    float* v_expert_fcw;
+    float* m_expert_fcb;
+    float* v_expert_fcb;
+    float* m_expert_fcprojw;
+    float* v_expert_fcprojw;
+    float* m_expert_fcprojb;
+    float* v_expert_fcprojb;
     int initialized;
     int scratch_bt;
     int scratch_topk;
@@ -912,6 +932,24 @@ static void gpt2_init_moe_state(GPT2* model, int B, int T) {
     model->moe.selected_expert = (int*)mallocCheck((size_t)BT * K * sizeof(int));
     model->moe.selected_expert_weight = (float*)mallocCheck((size_t)BT * K * sizeof(float));
     model->moe.retrieved_buffer = (float*)mallocCheck((size_t)BT * C * sizeof(float));
+    model->moe.d_router_w = (float*)calloc((size_t)E * C, sizeof(float));
+    model->moe.d_router_b = (float*)calloc((size_t)E, sizeof(float));
+    model->moe.d_expert_fcw = (float*)calloc((size_t)E * (4 * C) * C, sizeof(float));
+    model->moe.d_expert_fcb = (float*)calloc((size_t)E * (4 * C), sizeof(float));
+    model->moe.d_expert_fcprojw = (float*)calloc((size_t)E * C * (4 * C), sizeof(float));
+    model->moe.d_expert_fcprojb = (float*)calloc((size_t)E * C, sizeof(float));
+    model->moe.m_router_w = (float*)calloc((size_t)E * C, sizeof(float));
+    model->moe.v_router_w = (float*)calloc((size_t)E * C, sizeof(float));
+    model->moe.m_router_b = (float*)calloc((size_t)E, sizeof(float));
+    model->moe.v_router_b = (float*)calloc((size_t)E, sizeof(float));
+    model->moe.m_expert_fcw = (float*)calloc((size_t)E * (4 * C) * C, sizeof(float));
+    model->moe.v_expert_fcw = (float*)calloc((size_t)E * (4 * C) * C, sizeof(float));
+    model->moe.m_expert_fcb = (float*)calloc((size_t)E * (4 * C), sizeof(float));
+    model->moe.v_expert_fcb = (float*)calloc((size_t)E * (4 * C), sizeof(float));
+    model->moe.m_expert_fcprojw = (float*)calloc((size_t)E * C * (4 * C), sizeof(float));
+    model->moe.v_expert_fcprojw = (float*)calloc((size_t)E * C * (4 * C), sizeof(float));
+    model->moe.m_expert_fcprojb = (float*)calloc((size_t)E * C, sizeof(float));
+    model->moe.v_expert_fcprojb = (float*)calloc((size_t)E * C, sizeof(float));
     for (int i = 0; i < E * C; i++) { model->moe.router_w[i] = (MOE_NEXT_RAND() * 2.0f - 1.0f) * 0.02f; }
     for (int i = 0; i < E * (4 * C) * C; i++) { model->moe.expert_fcw[i] = (MOE_NEXT_RAND() * 2.0f - 1.0f) * 0.02f; }
     for (int i = 0; i < E * C * (4 * C); i++) { model->moe.expert_fcprojw[i] = (MOE_NEXT_RAND() * 2.0f - 1.0f) * 0.02f; }
@@ -1096,6 +1134,207 @@ static void moe_forward_topk_expert_local(GPT2* model, float* l_ln2, float* l_fc
                 fprintf(stderr, " e%d(p=%.4f)", selected[k], selected_w[k]);
             }
             fprintf(stderr, "\n");
+        }
+    }
+}
+
+static float gelu_grad_scalar(float x) {
+    float x2 = x * x;
+    float x3 = x2 * x;
+    float t = 0.7978845608f * (x + 0.044715f * x3);
+    float th = tanhf(t);
+    float sech2 = 1.0f - th * th;
+    float dt_dx = 0.7978845608f * (1.0f + 3.0f * 0.044715f * x2);
+    return 0.5f * (1.0f + th) + 0.5f * x * sech2 * dt_dx;
+}
+
+static void moe_zero_param_grads(GPT2* model) {
+    if (!model->moe_config.use_moe || !model->moe.initialized || model->moe.d_router_w == NULL) { return; }
+    int E = model->moe_config.moe_num_experts;
+    int C = model->config.channels;
+    memset(model->moe.d_router_w, 0, (size_t)E * C * sizeof(float));
+    memset(model->moe.d_router_b, 0, (size_t)E * sizeof(float));
+    memset(model->moe.d_expert_fcw, 0, (size_t)E * (4 * C) * C * sizeof(float));
+    memset(model->moe.d_expert_fcb, 0, (size_t)E * (4 * C) * sizeof(float));
+    memset(model->moe.d_expert_fcprojw, 0, (size_t)E * C * (4 * C) * sizeof(float));
+    memset(model->moe.d_expert_fcprojb, 0, (size_t)E * C * sizeof(float));
+}
+
+static void moe_backward_topk_expert_local(GPT2* model, const float* l_ln2, const float* dl_fcproj, float* dl_ln2, int B, int T, int C) {
+    if (!model->moe_config.use_moe || !model->moe.initialized) { return; }
+    int BT = B * T;
+    int E = model->moe_config.moe_num_experts;
+    int K = model->moe_config.moe_topk < E ? model->moe_config.moe_topk : E;
+    int S = model->moe_config.moe_expert_memory_slots;
+    int D = model->moe_config.moe_expert_memory_dim;
+    float scale = model->moe_config.moe_memory_fusion_scale;
+    float inv_tau = 1.0f / model->moe_config.moe_router_temperature;
+    float inv_sqrt_d = 1.0f / sqrtf((float)D);
+
+    for (int bt = 0; bt < BT; bt++) {
+        const float* h = l_ln2 + (size_t)bt * C;
+        const float* dout = dl_fcproj + (size_t)bt * C;
+        float* dh = dl_ln2 + (size_t)bt * C;
+        int* selected = model->moe.selected_expert + (size_t)bt * K;
+        float* selected_w = model->moe.selected_expert_weight + (size_t)bt * K;
+        float d_alpha[K];
+        float alpha_weighted_dalpha = 0.0f;
+        float expert_out[K][C];
+        float preacts[K][4 * C];
+        float gelu_out[K][4 * C];
+        float u_buf[K][C];
+        float mem_probs[K][S];
+
+        // recompute selected-expert forward intermediates needed for backward
+        for (int k = 0; k < K; k++) {
+            int expert = selected[k];
+            const float* fcw = model->moe.expert_fcw + (size_t)expert * (4 * C) * C;
+            const float* fcb = model->moe.expert_fcb + (size_t)expert * (4 * C);
+            const float* fcprojw = model->moe.expert_fcprojw + (size_t)expert * C * (4 * C);
+            const float* fcprojb = model->moe.expert_fcprojb + (size_t)expert * C;
+            const float* qproj = model->moe.memory_query_proj + (size_t)expert * D * C;
+            const float* slot_to_hidden = model->moe.memory_slot_to_hidden + (size_t)expert * C * D;
+            float query[D];
+
+            for (int o = 0; o < 4 * C; o++) {
+                float z = fcb[o];
+                const float* wrow = fcw + (size_t)o * C;
+                for (int c = 0; c < C; c++) { z += wrow[c] * h[c]; }
+                preacts[k][o] = z;
+                float cube = 0.044715f * z * z * z;
+                float inner = 0.7978845608f * (z + cube);
+                gelu_out[k][o] = 0.5f * z * (1.0f + tanhf(inner));
+            }
+            for (int o = 0; o < C; o++) {
+                float acc = fcprojb[o];
+                const float* wrow = fcprojw + (size_t)o * (4 * C);
+                for (int i = 0; i < 4 * C; i++) { acc += wrow[i] * gelu_out[k][i]; }
+                u_buf[k][o] = acc;
+            }
+            for (int d = 0; d < D; d++) {
+                float q = 0.0f;
+                const float* qrow = qproj + (size_t)d * C;
+                for (int c = 0; c < C; c++) { q += qrow[c] * u_buf[k][c]; }
+                query[d] = q;
+            }
+            float max_score = -FLT_MAX;
+            for (int s = 0; s < S; s++) {
+                const float* key = model->moe.expert_memory_keys + ((size_t)expert * S + s) * D;
+                float score = 0.0f;
+                for (int d = 0; d < D; d++) { score += query[d] * key[d]; }
+                score *= inv_sqrt_d;
+                mem_probs[k][s] = score;
+                if (score > max_score) { max_score = score; }
+            }
+            float psum = 0.0f;
+            for (int s = 0; s < S; s++) {
+                mem_probs[k][s] = expf(mem_probs[k][s] - max_score);
+                psum += mem_probs[k][s];
+            }
+            float inv_psum = psum > 0.0f ? 1.0f / psum : 0.0f;
+            for (int s = 0; s < S; s++) { mem_probs[k][s] *= inv_psum; }
+
+            float mem_read[D];
+            memset(mem_read, 0, (size_t)D * sizeof(float));
+            for (int s = 0; s < S; s++) {
+                const float* mem = model->moe.expert_memory + ((size_t)expert * S + s) * D;
+                float p = mem_probs[k][s];
+                for (int d = 0; d < D; d++) { mem_read[d] += p * mem[d]; }
+            }
+            for (int c = 0; c < C; c++) {
+                const float* mrow = slot_to_hidden + (size_t)c * D;
+                float mh = 0.0f;
+                for (int d = 0; d < D; d++) { mh += mrow[d] * mem_read[d]; }
+                expert_out[k][c] = u_buf[k][c] + scale * mh;
+            }
+
+            float dot = 0.0f;
+            for (int c = 0; c < C; c++) { dot += dout[c] * expert_out[k][c]; }
+            d_alpha[k] = dot;
+            alpha_weighted_dalpha += selected_w[k] * dot;
+        }
+
+        // selected-softmax router backward
+        for (int k = 0; k < K; k++) {
+            int expert = selected[k];
+            float dlogit = selected_w[k] * (d_alpha[k] - alpha_weighted_dalpha) * inv_tau;
+            model->moe.d_router_b[expert] += dlogit;
+            float* d_rw = model->moe.d_router_w + (size_t)expert * C;
+            const float* rw = model->moe.router_w + (size_t)expert * C;
+            for (int c = 0; c < C; c++) {
+                d_rw[c] += dlogit * h[c];
+                dh[c] += dlogit * rw[c];
+            }
+        }
+
+        for (int k = 0; k < K; k++) {
+            int expert = selected[k];
+            float route_w = selected_w[k];
+            float du[C];
+            const float* qproj = model->moe.memory_query_proj + (size_t)expert * D * C;
+            const float* slot_to_hidden = model->moe.memory_slot_to_hidden + (size_t)expert * C * D;
+            const float* fcw = model->moe.expert_fcw + (size_t)expert * (4 * C) * C;
+            const float* fcprojw = model->moe.expert_fcprojw + (size_t)expert * C * (4 * C);
+            float* d_fcw = model->moe.d_expert_fcw + (size_t)expert * (4 * C) * C;
+            float* d_fcb = model->moe.d_expert_fcb + (size_t)expert * (4 * C);
+            float* d_fcprojw = model->moe.d_expert_fcprojw + (size_t)expert * C * (4 * C);
+            float* d_fcprojb = model->moe.d_expert_fcprojb + (size_t)expert * C;
+
+            for (int c = 0; c < C; c++) { du[c] = route_w * dout[c]; }
+
+            // memory read path contributes to du via query softmax
+            if (scale != 0.0f) {
+                float d_mem_read[D];
+                float d_probs[S];
+                float d_scores[S];
+                float sum_p_dp = 0.0f;
+                for (int d = 0; d < D; d++) {
+                    float acc = 0.0f;
+                    for (int c = 0; c < C; c++) { acc += (scale * route_w * dout[c]) * slot_to_hidden[(size_t)c * D + d]; }
+                    d_mem_read[d] = acc;
+                }
+                for (int s = 0; s < S; s++) {
+                    const float* mem = model->moe.expert_memory + ((size_t)expert * S + s) * D;
+                    float dp = 0.0f;
+                    for (int d = 0; d < D; d++) { dp += d_mem_read[d] * mem[d]; }
+                    d_probs[s] = dp;
+                    sum_p_dp += mem_probs[k][s] * dp;
+                }
+                for (int s = 0; s < S; s++) {
+                    d_scores[s] = mem_probs[k][s] * (d_probs[s] - sum_p_dp);
+                }
+                for (int d = 0; d < D; d++) {
+                    float dq = 0.0f;
+                    const float* qrow = qproj + (size_t)d * C;
+                    for (int s = 0; s < S; s++) {
+                        const float* key = model->moe.expert_memory_keys + ((size_t)expert * S + s) * D;
+                        dq += d_scores[s] * key[d] * inv_sqrt_d;
+                    }
+                    for (int c = 0; c < C; c++) { du[c] += dq * qrow[c]; }
+                }
+            }
+
+            float dgelu[4 * C];
+            memset(dgelu, 0, (size_t)(4 * C) * sizeof(float));
+            for (int o = 0; o < C; o++) {
+                d_fcprojb[o] += du[o];
+                float* drow = d_fcprojw + (size_t)o * (4 * C);
+                const float* wrow = fcprojw + (size_t)o * (4 * C);
+                for (int i = 0; i < 4 * C; i++) {
+                    drow[i] += du[o] * gelu_out[k][i];
+                    dgelu[i] += du[o] * wrow[i];
+                }
+            }
+            for (int i = 0; i < 4 * C; i++) {
+                float dz = dgelu[i] * gelu_grad_scalar(preacts[k][i]);
+                d_fcb[i] += dz;
+                float* drow = d_fcw + (size_t)i * C;
+                const float* wrow = fcw + (size_t)i * C;
+                for (int c = 0; c < C; c++) {
+                    drow[c] += dz * h[c];
+                    dh[c] += dz * wrow[c];
+                }
+            }
         }
     }
 }
@@ -2119,6 +2358,7 @@ void gpt2_forward(GPT2 *model, int* inputs, int* targets, size_t B, size_t T) {
 void gpt2_zero_grad(GPT2 *model) {
     if(model->grads_memory != NULL) { memset(model->grads_memory, 0, model->num_parameters * sizeof(float)); }
     if(model->grads_acts_memory != NULL) { memset(model->grads_acts_memory, 0, model->num_activations * sizeof(float)); }
+    moe_zero_param_grads(model);
     if (model->alc_config.use_alc && model->alc.initialized) {
         alc_zero_param_grads(&model->alc, model->config.channels, model->alc_config.alc_slot_dim, model->alc_config.alc_key_dim);
     }
@@ -2131,16 +2371,6 @@ void gpt2_backward(GPT2 *model) {
         printf("Error: must forward with targets before backward\n");
         exit(1);
     }
-    if (model->moe_config.use_moe) {
-        for (int l = 0; l < model->config.num_layers; l++) {
-            if (moe_layer_enabled(model, l)) {
-                fprintf(stderr, "Error: gpt2_backward does not yet support MoE expert parameters in experimental path.\n");
-                fprintf(stderr, "Run forward-only MoE tests or disable MoE for training/backward.\n");
-                exit(1);
-            }
-        }
-    }
-
     // lazily allocate the memory for gradients of the weights and activations, if needed
     if (model->grads_memory == NULL) {
         model->grads_memory = malloc_and_point_parameters(&model->grads, model->param_sizes);
@@ -2235,9 +2465,13 @@ void gpt2_backward(GPT2 *model) {
             alc_backward_fuse_and_accumulate(model, l, dl_residual3, B, T);
         }
         residual_backward(dl_residual2, dl_fcproj, dl_residual3, B*T*C);
-        matmul_backward(dl_fch_gelu, dl_fcprojw, dl_fcprojb, dl_fcproj, l_fch_gelu, l_fcprojw, B, T, 4*C, C);
-        gelu_backward(dl_fch, l_fch, dl_fch_gelu, B*T*4*C);
-        matmul_backward(dl_ln2, dl_fcw, dl_fcb, dl_fch, l_ln2, l_fcw, B, T, C, 4*C);
+        if (moe_layer_enabled(model, l)) {
+            moe_backward_topk_expert_local(model, l_ln2, dl_fcproj, dl_ln2, B, T, C);
+        } else {
+            matmul_backward(dl_fch_gelu, dl_fcprojw, dl_fcprojb, dl_fcproj, l_fch_gelu, l_fcprojw, B, T, 4*C, C);
+            gelu_backward(dl_fch, l_fch, dl_fch_gelu, B*T*4*C);
+            matmul_backward(dl_ln2, dl_fcw, dl_fcb, dl_fch, l_ln2, l_fcw, B, T, C, 4*C);
+        }
         layernorm_backward(dl_residual2, dl_ln2w, dl_ln2b, dl_ln2, l_residual2, l_ln2w, l_ln2_mean, l_ln2_rstd, B, T, C);
         residual_backward(dresidual, dl_attproj, dl_residual2, B*T*C);
         matmul_backward(dl_atty, dl_attprojw, dl_attprojb, dl_attproj, l_atty, l_attprojw, B, T, C, C);
@@ -2294,6 +2528,22 @@ void gpt2_update(GPT2 *model, float learning_rate, float beta1, float beta2, flo
             alc_adamw_update(model->alc.gate_b, model->alc.d_gate_b, model->alc.m_gate_b, model->alc.v_gate_b,
                              C, learning_rate, beta1, beta2, eps, weight_decay, t);
         }
+    }
+    if (model->moe_config.use_moe && model->moe.initialized && model->moe.d_router_w != NULL) {
+        int E = model->moe_config.moe_num_experts;
+        int C = model->config.channels;
+        alc_adamw_update(model->moe.router_w, model->moe.d_router_w, model->moe.m_router_w, model->moe.v_router_w,
+                         (size_t)E * C, learning_rate, beta1, beta2, eps, weight_decay, t);
+        alc_adamw_update(model->moe.router_b, model->moe.d_router_b, model->moe.m_router_b, model->moe.v_router_b,
+                         (size_t)E, learning_rate, beta1, beta2, eps, weight_decay, t);
+        alc_adamw_update(model->moe.expert_fcw, model->moe.d_expert_fcw, model->moe.m_expert_fcw, model->moe.v_expert_fcw,
+                         (size_t)E * (4 * C) * C, learning_rate, beta1, beta2, eps, weight_decay, t);
+        alc_adamw_update(model->moe.expert_fcb, model->moe.d_expert_fcb, model->moe.m_expert_fcb, model->moe.v_expert_fcb,
+                         (size_t)E * (4 * C), learning_rate, beta1, beta2, eps, weight_decay, t);
+        alc_adamw_update(model->moe.expert_fcprojw, model->moe.d_expert_fcprojw, model->moe.m_expert_fcprojw, model->moe.v_expert_fcprojw,
+                         (size_t)E * C * (4 * C), learning_rate, beta1, beta2, eps, weight_decay, t);
+        alc_adamw_update(model->moe.expert_fcprojb, model->moe.d_expert_fcprojb, model->moe.m_expert_fcprojb, model->moe.v_expert_fcprojb,
+                         (size_t)E * C, learning_rate, beta1, beta2, eps, weight_decay, t);
     }
 }
 
@@ -2355,6 +2605,24 @@ void gpt2_free(GPT2 *model) {
     free(model->moe.selected_expert);
     free(model->moe.selected_expert_weight);
     free(model->moe.retrieved_buffer);
+    free(model->moe.d_router_w);
+    free(model->moe.d_router_b);
+    free(model->moe.d_expert_fcw);
+    free(model->moe.d_expert_fcb);
+    free(model->moe.d_expert_fcprojw);
+    free(model->moe.d_expert_fcprojb);
+    free(model->moe.m_router_w);
+    free(model->moe.v_router_w);
+    free(model->moe.m_router_b);
+    free(model->moe.v_router_b);
+    free(model->moe.m_expert_fcw);
+    free(model->moe.v_expert_fcw);
+    free(model->moe.m_expert_fcb);
+    free(model->moe.v_expert_fcb);
+    free(model->moe.m_expert_fcprojw);
+    free(model->moe.v_expert_fcprojw);
+    free(model->moe.m_expert_fcprojb);
+    free(model->moe.v_expert_fcprojb);
 }
 
 #ifndef TESTING
