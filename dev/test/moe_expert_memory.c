@@ -170,6 +170,54 @@ int main(void) {
         gpt2_free(&model);
     }
 
+    {
+        GPT2 model = make_test_model(3, 2, 1, 1);
+        model.moe_config.moe_memory_fusion_scale = 0.0f;
+        model.moe.router_b[0] = 3.0f;
+        model.moe.router_b[1] = 2.0f;
+        model.moe.router_b[2] = -10.0f;
+        model.moe.expert_fcprojb[0 * 2 + 0] = 1.0f;
+        model.moe.expert_fcprojb[1 * 2 + 0] = -2.0f;
+        model.moe.expert_fcprojb[2 * 2 + 0] = 4.0f;
+
+        float ln2[2] = {0.0f, 0.0f};
+        float out_before[2] = {0};
+        float out_after[2] = {0};
+        float dout[2] = {1.0f, 0.0f};
+        float dln2[2] = {0};
+
+        moe_forward_topk_expert_local(&model, ln2, out_before, 1, 1, 2);
+        int sel0 = model.moe.selected_expert[0];
+        int sel1 = model.moe.selected_expert[1];
+        int non_selected = 3 - (sel0 + sel1); // valid for experts {0,1,2}
+        assert(sel0 != sel1);
+        assert(non_selected >= 0 && non_selected < 3);
+        moe_zero_param_grads(&model);
+        moe_backward_topk_expert_local(&model, ln2, dout, dln2, 1, 1, 2);
+
+        assert(fabsf(model.moe.d_expert_fcprojb[sel0 * 2 + 0]) > 1e-7f);
+        assert(fabsf(model.moe.d_expert_fcprojb[sel1 * 2 + 0]) > 1e-7f);
+        assert(approx(model.moe.d_expert_fcprojb[non_selected * 2 + 0], 0.0f, 1e-8f));
+        assert(fabsf(model.moe.d_router_b[sel0]) > 1e-7f || fabsf(model.moe.d_router_b[sel1]) > 1e-7f);
+        assert(approx(model.moe.d_router_b[non_selected], 0.0f, 1e-8f));
+
+        float sel_bias_before = model.moe.expert_fcprojb[sel0 * 2 + 0];
+        float nonsel_bias_before = model.moe.expert_fcprojb[non_selected * 2 + 0];
+        float router_before = model.moe.router_b[sel0];
+        model.grads_memory = (float*)calloc(model.num_parameters, sizeof(float));
+        model.grads_acts_memory = (float*)calloc(model.num_activations, sizeof(float));
+        gpt2_update(&model, 0.05f, 0.9f, 0.999f, 1e-8f, 0.0f, 1);
+
+        assert(!approx(model.moe.expert_fcprojb[sel0 * 2 + 0], sel_bias_before, 1e-10f));
+        assert(approx(model.moe.expert_fcprojb[non_selected * 2 + 0], nonsel_bias_before, 1e-10f));
+        assert(!approx(model.moe.router_b[sel0], router_before, 1e-10f));
+
+        moe_forward_topk_expert_local(&model, ln2, out_after, 1, 1, 2);
+        assert(!approx(out_before[0], out_after[0], 1e-8f));
+
+        gpt2_free(&model);
+    }
+
     printf("moe_expert_memory top-2 tests passed\n");
     return 0;
 }
