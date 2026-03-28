@@ -1,154 +1,136 @@
-# MoE + Expert-Local Memory Design (Experimental Path)
+# MoE Expert-Local Memory Design (Experimental Path)
 
-## Current baseline summary (preserved)
+## Stage 1 audit of `train_gpt2_moe_experimental.c` (before this pass)
 
-Baseline is the current hardened ALC CPU training path in `train_gpt2.c`.
+- Router existed as top-1 over experts, but only as a scaffold.
+- FFN compute was still shared dense GPT-2 FFN (`fcw/fcb/fcprojw/fcprojb`) for all tokens.
+- MoE memory state had per-expert slots/keys, but memory read used post-dense FFN output and did not include expert-owned query/write/slot-to-hidden projections.
+- Forward integration called scaffold memory after dense FFN, not true `router -> expert_i FFN -> expert_i memory` ownership.
+- Backward path was still dense-only (no expert FFN gradients).
 
-- Transformer block is currently:
-  1. LN1 -> attention -> projection -> residual
-  2. LN2 -> FFN (`fcw/fcb` -> GELU -> `fcprojw/fcprojb`) -> residual
-  3. Optional ALC read/fuse/write after FFN residual (when enabled)
-- ALC is global across experts because experts do not exist yet; it has one slot bank + key bank per model, with routing controls and fusion/update modes.
+This milestone upgrades the experimental path to real top-1 routed expert FFN + expert-local memory.
 
-This baseline remains untouched and recoverable.
+## Exact block placement (implemented now)
 
-## Preserved baseline vs experimental target
+Within MoE-enabled transformer layers in the experimental file:
 
-- **Preserved baseline file:** `train_gpt2_alc_hardened_baseline.c` (verbatim copy of current hardened ALC implementation).
-- **Experimental target file:** `train_gpt2_moe_experimental.c` (separate architecture pass file).
+1. LN1 -> attention -> residual (unchanged)
+2. LN2
+3. Router (top-1 expert per token)
+4. Selected expert FFN (`FFN_i`)
+5. Selected expert local memory read + write (`Memory_i`)
+6. Fuse `u_i + scale * m_i^h`
+7. Residual add
+8. Optional global ALC (unchanged) runs after residual if enabled
 
-Rationale: isolate risk, keep stable hardened ALC behavior reviewable, and allow aggressive iteration without hidden regressions in the baseline.
+## Router semantics (implemented now)
 
-## Where FFN currently lives
+- Per token `(b,t)`, compute logits:
+  \[
+  r_{e} = w^{router}_{e}\cdot h + b^{router}_{e}
+  \]
+- Softmax probabilities are stored for diagnostics.
+- Top-1 index is selected with argmax and validated with bounds assertions.
+- Only selected expert contributes output in this milestone.
 
-Inside `gpt2_forward` per layer:
+## Expert FFN ownership (implemented now)
 
-- `matmul(l_fch, l_ln2, l_fcw, l_fcb)`
-- `gelu(l_fch_gelu, l_fch)`
-- `matmul(l_fcproj, l_fch_gelu, l_fcprojw, l_fcprojb)`
-- `residual(l_residual3, l_residual2, l_fcproj)`
+Each expert owns distinct FFN parameters in `MoEState`:
 
-In backward, the exact inverse path mirrors those tensors.
+- `expert_fcw` shape `(E, 4C, C)`
+- `expert_fcb` shape `(E, 4C)`
+- `expert_fcprojw` shape `(E, C, 4C)`
+- `expert_fcprojb` shape `(E, C)`
 
-## Architecture options considered
+For selected expert \(i\):
+\[
+f_i = \text{GELU}(W^{in}_i h + b^{in}_i),\quad
+u_i = W^{out}_i f_i + b^{out}_i
+\]
 
-### Option A — Full per-expert duplication (recommended long-term)
+## Expert-local memory ownership (implemented now)
 
-Replace FFN weights with per-expert FFN parameter sets and add per-expert memory banks.
+Each expert owns:
 
-- Each expert owns:
-  - FFN in/out projections
-  - local memory keys/slots
-  - local read/write behavior
-- Router picks top-k experts per token.
+- slots `expert_memory` `(E,S,D)`
+- slot keys `expert_memory_keys` `(E,S,D)`
+- query projection `memory_query_proj` `(E,D,C)`
+- write projection `memory_write_proj` `(E,D,C)`
+- slot-to-hidden projection `memory_slot_to_hidden` `(E,C,D)`
 
-**Pros:** strongest expert specialization; closest to target concept.
-**Cons:** highest parameter and runtime growth; invasive backward/optimizer/checkpoint changes.
+No cross-expert memory bank is used in this path.
 
-### Option B — Shared FFN, per-expert memory (recommended short-term stepping stone)
+## Read equations (implemented now)
 
-Keep current dense FFN weights unchanged; add router + per-expert memory as post-FFN experimental path.
+For selected expert \(i\):
 
-- Experts are represented first by router + local memory, while FFN remains shared.
+\[
+q_i = W^q_i u_i,\quad
+s_{ij} = \frac{q_i \cdot k_{ij}}{\sqrt{D}},\quad
+p_{ij} = \text{softmax}_j(s_{ij})
+\]
+\[
+m_i = \sum_j p_{ij} v_{ij},\quad
+m^h_i = W^m_i m_i,\quad
+o_i = u_i + \lambda m^h_i
+\]
 
-**Pros:** minimal invasive changes; preserves current training/backward flow; validates expert-local memory behavior quickly.
-**Cons:** not true MoE FFN capacity increase yet.
+where \(\lambda = \texttt{moe\_memory\_fusion\_scale}\).
 
-### Option C — Shared memory with expert-conditioned access (not preferred by default)
+## Write equations (implemented now)
 
-Maintain one global memory bank and condition reads/writes on expert id.
+Only selected expert \(i\) is updated:
 
-**Pros:** lower memory footprint.
-**Cons:** violates desired locality and expert specialization intent; more interference between experts.
+\[
+w_i = W^w_i u_i
+\]
+\[
+v_{ij} \leftarrow (1-\alpha) v_{ij} + \alpha\, p_{ij}\, w_i
+\]
+\[
+k_{ij} \leftarrow (1-\alpha) k_{ij} + \alpha\, p_{ij}\, q_i
+\]
 
-## Recommended design
+where \(\alpha = \texttt{moe\_memory\_update\_rate}\).
 
-Use a two-stage plan:
+## Why memory is after FFN
 
-1. **Now (minimal implementation): Option B scaffold in experimental file**
-   - Keep dense FFN compute path intact.
-   - Add MoE router and expert-local memory read/write scaffold after FFN projection and before residual add.
-   - Maintain baseline + ALC behavior availability.
+Memory is intentionally applied after expert FFN so lookup/write occur in the expert-transformed space \(u_i\), not raw shared LN2 space \(h\). This keeps specialization local to each expert’s representation.
 
-2. **Next (major pass): evolve to Option A full MoE FFN**
-   - Introduce per-expert FFN weights and top-k dispatch/combine.
-   - Keep expert-local memory attached to each expert output path.
+## Why expert-local memory instead of shared memory
 
-## Proposed insertion point and ordering
+- Prevents interference between unrelated experts.
+- Aligns sparse routing with sparse memory access/update.
+- Makes expert identity meaningful: `Expert_i = FFN_i + Memory_i`.
 
-Recommended ordering inside each transformer block:
+## Implemented now vs future work
 
-1. Attention path unchanged.
-2. LN2 output -> MoE routing.
-3. Expert FFN compute (or shared FFN in scaffold stage).
-4. Expert-local memory read/write on expert output.
-5. Fuse memory-enhanced expert output.
-6. Residual add.
-7. ALC application (optional), after FFN/MoE residual output.
+### Implemented now
 
-So the intended ordering is:
+- Top-1 per-token router.
+- True per-expert FFN parameters.
+- True per-expert memory parameters + state.
+- Selected-expert-only read/write behavior.
+- Forward integration in block path for MoE-enabled layers.
+- Unit tests for routing validity, expert/memory isolation, read/write activation, repeated-write isolation, and finite outputs.
 
-`attention -> MoE route -> expert FFN -> expert-local memory -> fusion -> residual -> ALC(optional)`
+### Future work (not in this pass)
 
-## ALC interaction decision
+- Top-k expert routing/combination.
+- Load balancing auxiliary losses.
+- MoE backward/optimizer support for expert parameters.
+- Checkpoint serialization of expert tensors.
+- Distributed expert parallelism.
 
-Primary recommendation: **per-expert memory bank** for MoE path (default), while keeping ALC as a separate optional global post-block mechanism.
+## Known limitations of this first top-1 milestone
 
-- Near term: keep existing ALC unchanged to avoid destabilizing hardened work.
-- Future option: add a config to disable global ALC when per-expert memory is active if redundancy is observed.
+- `gpt2_backward` explicitly rejects active MoE layers (forward-only milestone for now).
+- Router and expert weights are runtime-initialized in-memory and not checkpoint-loaded.
+- Single selected expert only (no expert combine).
 
-## Config fields needed
+## Experimental test build/run commands
 
-Added/needed MoE config (experimental):
-
-- `use_moe`
-- `moe_num_experts`
-- `moe_topk`
-- `moe_apply_every_n_layers`
-- `moe_router_mode`
-- `moe_expert_memory_slots`
-- `moe_expert_memory_dim`
-- `moe_memory_update_rate`
-- `moe_memory_fusion_scale`
-
-Environment plumbing mirrors these via `LLMC_MOE_*` variables in experimental path.
-
-## Parameter/state growth
-
-Let C=channels, E=experts, S=memory slots per expert, D=memory dim.
-
-Scaffold growth (current experimental pass):
-
-- Router params: `E*C + E`
-- Expert memory state: `E*S*D` values + `E*S*D` keys
-- Scratch: `B*T*E` logits/probs + `B*T` selected expert + `B*T*C` retrieval buffer
-
-Full MoE FFN (future) adds approximately (for GPT-2 MLP style):
-
-- Per-expert FFN weights: `E*(4*C*C + 4*C + 4*C*C + C)`
-- Optional factorized variants can reduce this if needed.
-
-## Least invasive implementation plan
-
-1. Preserve baseline file untouched.
-2. Create experimental file copy.
-3. Add MoE config + runtime state structs in experimental file.
-4. Add router + expert-local memory scaffold in forward only.
-5. Keep default `use_moe=0` to preserve behavior unless explicitly enabled.
-6. Keep backward and optimizer baseline-compatible for now.
-
-## Recommended implementation stages
-
-1. **Stage 0 (done):** file separation + design doc.
-2. **Stage 1 (done):** config/state plumbing and forward scaffold with expert-local memory.
-3. **Stage 2:** add deterministic unit test for expert routing + memory read/write invariants.
-4. **Stage 3:** replace shared FFN with true per-expert FFN compute (top-1 first, then top-k).
-5. **Stage 4:** add backward support for router and expert FFN params.
-6. **Stage 5:** checkpoint format updates for MoE params/state.
-
-## Risks and tradeoffs
-
-- Current scaffold is intentionally minimal and not a complete production MoE training path.
-- Forward memory fusion changes outputs when enabled; backward does not yet model MoE-memory gradients.
-- Full MoE conversion will require activation layout updates, optimizer state expansion, and careful checkpoint versioning.
-- Keeping baseline isolated avoids accidental regressions while this is under iteration.
+```bash
+gcc -Ofast -g -I. dev/test/moe_expert_memory.c -lm -o dev/test/moe_expert_memory
+./dev/test/moe_expert_memory
+```
