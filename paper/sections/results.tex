@@ -1,21 +1,38 @@
 \section{Results}
-\subsection{Main results (multi-seed where available)}
+\subsection{Primary evidence: SessionKV-DR}
 \begin{table}[h]
 \centering
-\begin{tabular}{ll}
+\begin{tabular}{llll}
 \toprule
-\input{tables/main_results.tex}
+\input{tables/sessionkv_main.tex}
 \bottomrule
 \end{tabular}
-\caption{Main results. Multi-seed entries report mean $\pm$ std and 95\% CI (n=5). Persistence and efficiency remain single-reference-run in this pass.}
+\caption{SessionKV-DR delayed recall (mean $\pm$ std, 95\% CI, n=5).}
 \end{table}
 
-\subsection{Interpretation}
-ALC improves over the stale-memory baseline on core adaptation and on the added language-shaped delayed-recall benchmark. Stability remains strong in this suite (no NaN events across 10k-step stress runs in all seeds), and persistence round-trip remains exact in the reference run. Trainability improvements are consistent across seeds.
+\begin{table}[h]
+\centering
+\begin{tabular}{llll}
+\toprule
+\input{tables/sessionkv_overwrite.tex}
+\bottomrule
+\end{tabular}
+\caption{SessionKV-DR overwrite and persistence metrics (mean $\pm$ std, 95\% CI, n=5 where available).}
+\end{table}
 
-However, the no-write control is competitive and in some metrics stronger than full ALC, indicating that write-policy/interference remains an open issue. Therefore we frame evidence as mechanism-level: ALC can provide controlled adaptation benefits in this setup, but current results do not justify broad claims beyond this scope.
+\begin{table}[h]
+\centering
+\begin{tabular}{llll}
+\toprule
+\input{tables/sessionkv_capacity.tex}
+\bottomrule
+\end{tabular}
+\caption{SessionKV-DR capacity/interference sweep.}
+\end{table}
 
-\subsection{Lightweight QA Benchmark}
+SessionKV-DR is designed so success depends on inference-time session memory operations rather than generic QA priors. We therefore treat these tables as the primary evidence for ALC's mechanism claim. We report all three variants (baseline, no-write, full ALC) for each sub-evaluation and retain negative or mixed outcomes when no-write is competitive.
+
+\subsection{Supporting evidence: TinyQA}
 \begin{table}[h]
 \centering
 \begin{tabular}{llll}
@@ -23,20 +40,10 @@ However, the no-write control is competitive and in some metrics stronger than f
 \input{tables/tinyqa_results.tex}
 \bottomrule
 \end{tabular}
-\caption{Lightweight Tiny-QA-style benchmark under delayed recall. Values are QA accuracy (mean $\pm$ std across 5 seeds).}
+\caption{TinyQA delayed QA accuracy (supporting evidence only).}
 \end{table}
 
-This semi-realistic QA evaluation adds evidence beyond purely synthetic recall probes. In this setup, ALC full improves delayed QA accuracy over baseline and no-write controls at non-zero delays, while absolute accuracies remain modest; we therefore treat these results as directional mechanism evidence rather than broad language QA claims.
+TinyQA remains useful as a semi-realistic check, but it is not used as the main claim test for structured write-retain-retrieve behavior.
 
-\subsection{Ablations}
-Ablation results over slot count, update rate, routing mode, and fusion mode are exported to \texttt{paper/tables/ablation\_results.csv}. The top-10 single-run ablations are listed below.
-
-\begin{table}[h]
-\centering
-\begin{tabular}{ll}
-\toprule
-\input{tables/ablation_top10.tex}
-\bottomrule
-\end{tabular}
-\caption{Top-10 ablation variants by recall MSE in the reference run (lower is better).}
-\end{table}
+\subsection{Additional diagnostics}
+Main-package summaries, stability, trainability, ablations, and tiny efficiency checks are retained for reproducibility and context.

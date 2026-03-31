@@ -37,6 +37,10 @@ def fmt_ms(exp, variant, metric, precision=4):
 
 
 lines = ['| Experiment | Key result |', '|---|---|']
+sessionkv = summary.get('sessionkv', {})
+if sessionkv:
+    lines.append(f"| SessionKV-DR delayed recall (delay=6,facts=4) | baseline={sessionkv.get('baseline::delayed_acc_delay_6_facts_4', float('nan')):.3f}, alc_no_write={sessionkv.get('alc_no_write::delayed_acc_delay_6_facts_4', float('nan')):.3f}, alc={sessionkv.get('alc::delayed_acc_delay_6_facts_4', float('nan')):.3f} |")
+    lines.append(f"| SessionKV-DR overwrite | baseline={sessionkv.get('baseline::overwrite_acc', float('nan')):.3f}, alc_no_write={sessionkv.get('alc_no_write::overwrite_acc', float('nan')):.3f}, alc={sessionkv.get('alc::overwrite_acc', float('nan')):.3f} |")
 core = summary.get('core_adaptation', {})
 if core:
     lines.append(f"| Core adaptation | recall_mse baseline={core.get('baseline::recall_mse', float('nan')):.4f}, alc_no_write={core.get('alc_no_write::recall_mse', float('nan')):.4f}, alc={core.get('alc::recall_mse', float('nan')):.4f} |")
@@ -65,10 +69,11 @@ row_end = r"\\"
 main_tex = [
     f'Metric & Result {row_end}',
     '\\midrule',
-    f"Core recall MSE (baseline) & {fmt_ms('core_adaptation', 'baseline', 'recall_mse')} {row_end}",
-    f"Core recall MSE (ALC no-write) & {fmt_ms('core_adaptation', 'alc_no_write', 'recall_mse')} {row_end}",
-    f"Core recall MSE (ALC full) & {fmt_ms('core_adaptation', 'alc', 'recall_mse')} {row_end}",
-    f"Core recall accuracy (ALC full) & {fmt_ms('core_adaptation', 'alc', 'recall_acc', 3)} {row_end}",
+    f"SessionKV delayed acc d=6,f=4 (baseline) & {fmt_ms('sessionkv', 'baseline', 'delayed_acc_delay_6_facts_4', 3)} {row_end}",
+    f"SessionKV delayed acc d=6,f=4 (ALC no-write) & {fmt_ms('sessionkv', 'alc_no_write', 'delayed_acc_delay_6_facts_4', 3)} {row_end}",
+    f"SessionKV delayed acc d=6,f=4 (ALC full) & {fmt_ms('sessionkv', 'alc', 'delayed_acc_delay_6_facts_4', 3)} {row_end}",
+    f"SessionKV overwrite acc (ALC full) & {fmt_ms('sessionkv', 'alc', 'overwrite_acc', 3)} {row_end}",
+    f"SessionKV persistence recall acc (ALC full) & {fmt_ms('sessionkv', 'alc', 'persistence_recall_acc', 3)} {row_end}",
     f"Language-shaped recall MSE (baseline) & {fmt_ms('language_benchmark', 'baseline', 'recall_mse')} {row_end}",
     f"Language-shaped recall MSE (ALC no-write) & {fmt_ms('language_benchmark', 'alc_no_write', 'recall_mse')} {row_end}",
     f"Language-shaped recall MSE (ALC full) & {fmt_ms('language_benchmark', 'alc', 'recall_mse')} {row_end}",
@@ -93,6 +98,42 @@ for d in [0, 4, 8]:
         f"{fmt_ms('tinyqa', 'alc', f'qa_acc_delay_{d}', 3)} {row_end}"
     )
 (root / 'tables' / 'tinyqa_results.tex').write_text('\n'.join(tinyqa_tex) + '\n')
+
+sessionkv_main_tex = [f'Delay/Facts & Baseline & ALC no-write & ALC full {row_end}', '\\midrule']
+for delay in [0, 2, 6, 12]:
+    metric = f'delayed_acc_delay_{delay}_facts_4'
+    sessionkv_main_tex.append(
+        f"d={delay}, f=4 & {fmt_ms('sessionkv', 'baseline', metric, 3)} & "
+        f"{fmt_ms('sessionkv', 'alc_no_write', metric, 3)} & "
+        f"{fmt_ms('sessionkv', 'alc', metric, 3)} {row_end}"
+    )
+(root / 'tables' / 'sessionkv_main.tex').write_text('\n'.join(sessionkv_main_tex) + '\n')
+
+sessionkv_overwrite_tex = [f'Metric & Baseline & ALC no-write & ALC full {row_end}', '\\midrule']
+for metric, label in [('overwrite_acc', 'Overwrite accuracy'), ('stale_confusion_rate', 'Stale confusion rate'), ('persistence_recall_acc', 'Persistence recall acc')]:
+    sessionkv_overwrite_tex.append(
+        f"{label} & {fmt_ms('sessionkv', 'baseline', metric, 3)} & "
+        f"{fmt_ms('sessionkv', 'alc_no_write', metric, 3)} & "
+        f"{fmt_ms('sessionkv', 'alc', metric, 3)} {row_end}"
+    )
+(root / 'tables' / 'sessionkv_overwrite.tex').write_text('\n'.join(sessionkv_overwrite_tex) + '\n')
+
+sessionkv_capacity_tex = [f'Setting & Baseline & ALC no-write & ALC full {row_end}', '\\midrule']
+for facts in [1, 4, 8]:
+    metric = f'delayed_acc_delay_6_facts_{facts}'
+    sessionkv_capacity_tex.append(
+        f"facts={facts}, delay=6 & {fmt_ms('sessionkv', 'baseline', metric, 3)} & "
+        f"{fmt_ms('sessionkv', 'alc_no_write', metric, 3)} & "
+        f"{fmt_ms('sessionkv', 'alc', metric, 3)} {row_end}"
+    )
+for distractors in [0, 4, 12, 24]:
+    metric = f'acc_distractors_{distractors}'
+    sessionkv_capacity_tex.append(
+        f"distractors={distractors}, facts=4 & {fmt_ms('sessionkv', 'baseline', metric, 3)} & "
+        f"{fmt_ms('sessionkv', 'alc_no_write', metric, 3)} & "
+        f"{fmt_ms('sessionkv', 'alc', metric, 3)} {row_end}"
+    )
+(root / 'tables' / 'sessionkv_capacity.tex').write_text('\n'.join(sessionkv_capacity_tex) + '\n')
 
 try:
     import matplotlib.pyplot as plt
