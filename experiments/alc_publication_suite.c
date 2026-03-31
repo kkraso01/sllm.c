@@ -40,6 +40,20 @@ static float mse_slice(const float* x, const float* y, int n) {
     return s / (float)n;
 }
 
+static float run_core_episode(GPT2* m, const float* hidden, const float* query, const float* target, int value_offset, int apply_write) {
+    int B = 1, T = 1;
+    if (apply_write) {
+        float hcopy[16]; memcpy(hcopy, hidden, 16 * sizeof(float));
+        alc_forward_read_and_fuse(m, hcopy, B, T, 0);
+        alc_write_update(m, hcopy, B, T);
+    }
+    float q1[16]; memcpy(q1, query, 16 * sizeof(float));
+    alc_forward_read_and_fuse(m, q1, B, T, 0);
+    float pred[4];
+    for (int d = 0; d < 4; d++) pred[d] = q1[value_offset + d];
+    return mse_slice(pred, target, 4);
+}
+
 static void run_core_adaptation(FILE* f) {
     GPT2 m;
     memset(&m, 0, sizeof(m));
@@ -52,16 +66,24 @@ static void run_core_adaptation(FILE* f) {
         .alc_additive_scale = 1.0f, .alc_routing_mode = ALC_ROUTING_TOPK_SOFTMAX,
         .alc_topk = 1, .alc_temperature = 0.1f,
     };
+    GPT2 m_nowrite = m;
+    m_nowrite.alc_config.alc_update_mode = ALC_UPDATE_OFF;
+    m_nowrite.alc_config.alc_update_rate = 0.0f;
     int B = 1, T = 1, value_offset = 8;
     gpt2_init_alc_state(&m, B, T);
+    gpt2_init_alc_state(&m_nowrite, B, T);
     alc_ensure_layer_traces(&m, B, T);
+    alc_ensure_layer_traces(&m_nowrite, B, T);
     setup_identity_interface(&m, value_offset);
+    setup_identity_interface(&m_nowrite, value_offset);
     memset(m.alc.slots, 0, (size_t)m.alc_config.alc_num_slots * m.alc_config.alc_slot_dim * sizeof(float));
     memset(m.alc.slot_keys, 0, (size_t)m.alc_config.alc_num_slots * m.alc_config.alc_key_dim * sizeof(float));
+    memset(m_nowrite.alc.slots, 0, (size_t)m_nowrite.alc_config.alc_num_slots * m_nowrite.alc_config.alc_slot_dim * sizeof(float));
+    memset(m_nowrite.alc.slot_keys, 0, (size_t)m_nowrite.alc_config.alc_num_slots * m_nowrite.alc_config.alc_key_dim * sizeof(float));
 
     int episodes = 64;
-    int good_baseline = 0, good_alc = 0;
-    float mse_baseline = 0.0f, mse_alc = 0.0f;
+    int good_baseline = 0, good_alc = 0, good_nowrite = 0;
+    float mse_baseline = 0.0f, mse_alc = 0.0f, mse_nowrite = 0.0f;
 
     for (int e = 0; e < episodes; e++) {
         int slot_id = e % m.alc_config.alc_num_slots;
@@ -69,7 +91,7 @@ static void run_core_adaptation(FILE* f) {
         float query[16] = {0};
         float target[4];
         for (int k = 0; k < 4; k++) {
-            float keyv = (k == slot_id % 4) ? 4.0f : -1.0f;
+            float keyv = (k == (slot_id % 4)) ? 4.0f : -1.0f;
             hidden[k] = keyv;
             query[k] = keyv;
         }
@@ -78,35 +100,33 @@ static void run_core_adaptation(FILE* f) {
             hidden[value_offset + d] = target[d];
         }
 
-        // baseline: query before update
+        // baseline: query before writing current fact
         float q0[16]; memcpy(q0, query, sizeof(q0));
         alc_forward_read_and_fuse(&m, q0, B, T, 0);
-        float pred0[4];
-        for (int d = 0; d < 4; d++) pred0[d] = q0[value_offset + d];
-        float m0 = mse_slice(pred0, target, 4);
+        float m0 = mse_slice(q0 + value_offset, target, 4);
         mse_baseline += m0;
         if (m0 < 0.1f) good_baseline++;
 
-        // adapt: write then query
-        float hcopy[16]; memcpy(hcopy, hidden, sizeof(hcopy));
-        alc_forward_read_and_fuse(&m, hcopy, B, T, 0);
-        alc_write_update(&m, hcopy, B, T);
-
-        float q1[16]; memcpy(q1, query, sizeof(q1));
-        alc_forward_read_and_fuse(&m, q1, B, T, 0);
-        float pred1[4];
-        for (int d = 0; d < 4; d++) pred1[d] = q1[value_offset + d];
-        float m1 = mse_slice(pred1, target, 4);
+        // full ALC: write then query
+        float m1 = run_core_episode(&m, hidden, query, target, value_offset, 1);
         mse_alc += m1;
         if (m1 < 0.1f) good_alc++;
+
+        // stronger baseline: ALC interface active but writes disabled
+        float m2 = run_core_episode(&m_nowrite, hidden, query, target, value_offset, 1);
+        mse_nowrite += m2;
+        if (m2 < 0.1f) good_nowrite++;
     }
 
     fprintf(f, "core_adaptation,baseline,recall_mse,%.8f\n", mse_baseline / episodes);
     fprintf(f, "core_adaptation,alc,recall_mse,%.8f\n", mse_alc / episodes);
+    fprintf(f, "core_adaptation,alc_no_write,recall_mse,%.8f\n", mse_nowrite / episodes);
     fprintf(f, "core_adaptation,baseline,recall_acc,%.8f\n", (float)good_baseline / episodes);
     fprintf(f, "core_adaptation,alc,recall_acc,%.8f\n", (float)good_alc / episodes);
+    fprintf(f, "core_adaptation,alc_no_write,recall_acc,%.8f\n", (float)good_nowrite / episodes);
 
     gpt2_free(&m);
+    gpt2_free(&m_nowrite);
 }
 
 static float l2norm(const float* x, size_t n) {
@@ -296,6 +316,91 @@ static void run_ablations(FILE* f) {
     }
 }
 
+static void run_language_shaped_benchmark(FILE* f) {
+    GPT2 m; memset(&m, 0, sizeof(m));
+    m.config.channels = 24; m.config.num_layers = 1;
+    m.alc_config = (ALCConfig){
+        .use_alc = 1, .alc_num_slots = 8, .alc_slot_dim = 6, .alc_key_dim = 4,
+        .alc_update_rate = 0.4f, .alc_fusion_mode = ALC_FUSION_ADDITIVE,
+        .alc_update_mode = ALC_UPDATE_ALWAYS, .alc_apply_every_n_layers = 1,
+        .alc_additive_scale = 1.0f, .alc_routing_mode = ALC_ROUTING_TOPK_SOFTMAX,
+        .alc_topk = 2, .alc_temperature = 0.7f,
+    };
+    GPT2 m_nowrite = m;
+    m_nowrite.alc_config.alc_update_mode = ALC_UPDATE_OFF;
+    m_nowrite.alc_config.alc_update_rate = 0.0f;
+    int B = 1, T = 1, key_dim = 4, val_dim = 6, value_offset = 12;
+    gpt2_init_alc_state(&m, B, T);
+    gpt2_init_alc_state(&m_nowrite, B, T);
+    alc_ensure_layer_traces(&m, B, T);
+    alc_ensure_layer_traces(&m_nowrite, B, T);
+    setup_identity_interface(&m, value_offset);
+    setup_identity_interface(&m_nowrite, value_offset);
+
+    int facts = 96;
+    int gap_steps = 4;
+    int good_base = 0, good_alc = 0, good_nowrite = 0;
+    float mse_base = 0.0f, mse_alc = 0.0f, mse_nowrite = 0.0f;
+    for (int i = 0; i < facts; i++) {
+        float hidden[24] = {0}, query[24] = {0}, target[6];
+        int key_id = i % m.alc_config.alc_num_slots;
+        for (int k = 0; k < key_dim; k++) {
+            float v = (k == (key_id % key_dim)) ? 3.0f : -0.25f;
+            hidden[k] = v;
+            query[k] = v;
+        }
+        for (int d = 0; d < val_dim; d++) {
+            target[d] = frand_sym();
+            hidden[value_offset + d] = target[d];
+        }
+        float qb[24]; memcpy(qb, query, sizeof(qb));
+        alc_forward_read_and_fuse(&m, qb, B, T, 0);
+        float m_base = mse_slice(qb + value_offset, target, val_dim);
+
+        // insert fact
+        float hcopy[24]; memcpy(hcopy, hidden, sizeof(hcopy));
+        alc_forward_read_and_fuse(&m, hcopy, B, T, 0);
+        alc_write_update(&m, hcopy, B, T);
+        float hcopy_nw[24]; memcpy(hcopy_nw, hidden, sizeof(hcopy_nw));
+        alc_forward_read_and_fuse(&m_nowrite, hcopy_nw, B, T, 0);
+        alc_write_update(&m_nowrite, hcopy_nw, B, T);
+
+        // distractor updates
+        for (int g = 0; g < gap_steps; g++) {
+            float distractor[24] = {0};
+            int dk = (i + g + 1) % m.alc_config.alc_num_slots;
+            for (int k = 0; k < key_dim; k++) distractor[k] = (k == (dk % key_dim)) ? 2.5f : -0.5f;
+            for (int d = 0; d < val_dim; d++) distractor[value_offset + d] = frand_sym();
+            alc_forward_read_and_fuse(&m, distractor, B, T, 0);
+            alc_write_update(&m, distractor, B, T);
+            alc_forward_read_and_fuse(&m_nowrite, distractor, B, T, 0);
+            alc_write_update(&m_nowrite, distractor, B, T);
+        }
+
+        float q[24]; memcpy(q, query, sizeof(q));
+        alc_forward_read_and_fuse(&m, q, B, T, 0);
+        float qnw[24]; memcpy(qnw, query, sizeof(qnw));
+        alc_forward_read_and_fuse(&m_nowrite, qnw, B, T, 0);
+        float m_full = mse_slice(q + value_offset, target, val_dim);
+        float m_nw = mse_slice(qnw + value_offset, target, val_dim);
+        mse_base += m_base;
+        mse_alc += m_full;
+        mse_nowrite += m_nw;
+        if (m_base < 0.1f) good_base++;
+        if (m_full < 0.1f) good_alc++;
+        if (m_nw < 0.1f) good_nowrite++;
+    }
+    fprintf(f, "language_benchmark,baseline,recall_mse,%.8f\n", mse_base / facts);
+    fprintf(f, "language_benchmark,alc,recall_mse,%.8f\n", mse_alc / facts);
+    fprintf(f, "language_benchmark,alc_no_write,recall_mse,%.8f\n", mse_nowrite / facts);
+    fprintf(f, "language_benchmark,baseline,recall_acc,%.8f\n", (float)good_base / facts);
+    fprintf(f, "language_benchmark,alc,recall_acc,%.8f\n", (float)good_alc / facts);
+    fprintf(f, "language_benchmark,alc_no_write,recall_acc,%.8f\n", (float)good_nowrite / facts);
+
+    gpt2_free(&m);
+    gpt2_free(&m_nowrite);
+}
+
 static double now_s(void) {
     struct timespec ts;
     clock_gettime(CLOCK_MONOTONIC, &ts);
@@ -337,16 +442,18 @@ static void run_efficiency(FILE* f) {
 int main(int argc, char** argv) {
     const char* out_csv = (argc > 1) ? argv[1] : "paper/results/metrics.csv";
     const char* outdir = (argc > 2) ? argv[2] : "paper/results";
-    srand(42);
+    int seed = (argc > 3) ? atoi(argv[3]) : 42;
+    srand(seed);
     FILE* f = fopenCheck(out_csv, "w");
     fprintf(f, "experiment,variant,metric,value\n");
     run_core_adaptation(f);
     run_stability(f);
     run_persistence(f, outdir);
     run_trainability(f);
+    run_language_shaped_benchmark(f);
     run_ablations(f);
     run_efficiency(f);
     fcloseCheck(f);
-    printf("wrote %s\n", out_csv);
+    printf("wrote %s (seed=%d)\n", out_csv, seed);
     return 0;
 }

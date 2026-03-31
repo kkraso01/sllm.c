@@ -1,6 +1,6 @@
 \section{Introduction}
-Many deployment settings require models to adapt to newly observed information during inference while preserving safety and reproducibility constraints that discourage direct weight updates. We investigate whether a compact, explicit memory mechanism can provide useful adaptation in this regime.
+Many deployment settings need adaptation to newly observed information at inference time, while preserving constraints that discourage direct post-deployment weight updates. We study whether an explicit mutable memory module can provide useful adaptation under these constraints.
 
-This paper reports a publication-oriented evaluation of the finalized Adaptive Learning Component (ALC) implementation in \texttt{llm.c}. ALC augments a transformer block with slot/key memory, differentiable routing (softmax or top-k softmax), and routing-weighted state updates. The mechanism is explicitly designed to support persistence and controlled behavior.
+This paper reports a final pre-submission strengthening pass for the finalized Adaptive Learning Component (ALC) implementation in \texttt{llm.c}. ALC augments a transformer block with slot/key memory, differentiable routing, routing-weighted updates, and explicit save/load semantics.
 
-Our contribution in this pass is empirical and packaging-focused: a reproducible experiment suite, a paper-ready results pipeline, and an honest related-work positioning with conservative claims.
+The contribution of this pass is empirical and packaging-focused: (i) multi-seed robustness reporting, (ii) a stronger baseline comparison beyond plain baseline (ALC no-write), (iii) one additional semi-realistic language-shaped delayed-recall benchmark, and (iv) tighter evidence-disciplined writing for workshop/arXiv readiness. We intentionally avoid adding new core architecture features in this pass.

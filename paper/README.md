@@ -9,8 +9,13 @@
 Outputs:
 - `paper/results/metrics.csv`
 - `paper/results/summary.json`
+- `paper/results/multiseed_raw.csv`
+- `paper/results/multiseed_summary.csv`
+- `paper/results/multiseed_summary.json`
 - `paper/tables/main_results.md`
+- `paper/tables/main_results.tex`
 - `paper/tables/ablation_results.csv`
+- `paper/tables/ablation_top10.tex`
 - `paper/figures/FIGURE_GENERATION_WARNING.txt` (if matplotlib unavailable)
 
 ## Build LaTeX draft

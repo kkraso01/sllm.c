@@ -4,9 +4,17 @@ Raw and summarized outputs:
 \begin{itemize}
   \item \texttt{paper/results/metrics.csv}
   \item \texttt{paper/results/summary.json}
+  \item \texttt{paper/results/multiseed\_raw.csv}
+  \item \texttt{paper/results/multiseed\_summary.csv}
+  \item \texttt{paper/results/multiseed\_summary.json}
   \item \texttt{paper/tables/main\_results.md}
+  \item \texttt{paper/tables/main\_results.tex}
   \item \texttt{paper/tables/ablation\_results.csv}
+  \item \texttt{paper/tables/ablation\_top10.tex}
 \end{itemize}
 
+\subsection{Seeds and settings}
+Multi-seed runs use seeds \{42, 1337, 2027, 31415, 27182\}. Stability uses 10k updates per seed. Persistence uses the same finalized save/load API and currently remains a single-reference-run check in this pass.
+
 \subsection{Figure generation note}
-In this run environment, matplotlib was unavailable; figure generation was skipped and logged in \texttt{paper/figures/FIGURE\_GENERATION\_WARNING.txt}.
+In this run environment, matplotlib was unavailable; figure PNG rendering was skipped and logged in \texttt{paper/figures/FIGURE\_GENERATION\_WARNING.txt}. Tables and CSV/JSON artifacts are fully generated.
