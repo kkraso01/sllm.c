@@ -402,6 +402,255 @@ static void run_language_shaped_benchmark(FILE* f) {
     gpt2_free(&m_nowrite);
 }
 
+static int argmax_idx(const float* x, int n) {
+    int best = 0;
+    float bestv = x[0];
+    for (int i = 1; i < n; i++) {
+        if (x[i] > bestv) {
+            bestv = x[i];
+            best = i;
+        }
+    }
+    return best;
+}
+
+static void sessionkv_reset_memory(GPT2* m) {
+    memset(m->alc.slots, 0, (size_t)m->alc_config.alc_num_slots * m->alc_config.alc_slot_dim * sizeof(float));
+    memset(m->alc.slot_keys, 0, (size_t)m->alc_config.alc_num_slots * m->alc_config.alc_key_dim * sizeof(float));
+}
+
+static void sessionkv_build_hidden(float* h, int C, int key_dim, int value_offset, int value_dim, int key_id, int value_id) {
+    memset(h, 0, (size_t)C * sizeof(float));
+    h[key_id % key_dim] = 3.0f;
+    for (int k = 0; k < key_dim; k++) if (k != (key_id % key_dim)) h[k] = -0.3f;
+    h[value_offset + (value_id % value_dim)] = 3.0f;
+    for (int d = 0; d < value_dim; d++) if (d != (value_id % value_dim)) h[value_offset + d] = -0.3f;
+}
+
+static void sessionkv_build_query(float* q, int C, int key_dim, int key_id) {
+    memset(q, 0, (size_t)C * sizeof(float));
+    q[key_id % key_dim] = 3.0f;
+    for (int k = 0; k < key_dim; k++) if (k != (key_id % key_dim)) q[k] = -0.3f;
+}
+
+static int sessionkv_predict_value(GPT2* m, int key_id, int value_offset, int value_dim) {
+    int C = m->config.channels;
+    int key_dim = m->alc_config.alc_key_dim;
+    float q[64];
+    sessionkv_build_query(q, C, key_dim, key_id);
+    alc_forward_read_and_fuse(m, q, 1, 1, 0);
+    return argmax_idx(q + value_offset, value_dim);
+}
+
+static void run_sessionkv_benchmark(FILE* f, const char* outdir) {
+    GPT2 m_alc; memset(&m_alc, 0, sizeof(m_alc));
+    m_alc.config.channels = 32; m_alc.config.num_layers = 1;
+    m_alc.alc_config = (ALCConfig){
+        .use_alc = 1, .alc_num_slots = 32, .alc_slot_dim = 8, .alc_key_dim = 8,
+        .alc_update_rate = 0.4f, .alc_fusion_mode = ALC_FUSION_ADDITIVE,
+        .alc_update_mode = ALC_UPDATE_ALWAYS, .alc_apply_every_n_layers = 1,
+        .alc_additive_scale = 1.0f, .alc_routing_mode = ALC_ROUTING_TOPK_SOFTMAX,
+        .alc_topk = 2, .alc_temperature = 0.7f,
+    };
+    GPT2 m_nowrite = m_alc;
+    m_nowrite.alc_config.alc_update_mode = ALC_UPDATE_OFF;
+    m_nowrite.alc_config.alc_update_rate = 0.0f;
+    GPT2 m_baseline = m_alc;
+    m_baseline.alc_config.alc_update_mode = ALC_UPDATE_OFF;
+    m_baseline.alc_config.alc_update_rate = 0.0f;
+    int B = 1, T = 1, value_offset = 16, value_dim = 8;
+    gpt2_init_alc_state(&m_alc, B, T); gpt2_init_alc_state(&m_nowrite, B, T); gpt2_init_alc_state(&m_baseline, B, T);
+    alc_ensure_layer_traces(&m_alc, B, T); alc_ensure_layer_traces(&m_nowrite, B, T); alc_ensure_layer_traces(&m_baseline, B, T);
+    setup_identity_interface(&m_alc, value_offset); setup_identity_interface(&m_nowrite, value_offset); setup_identity_interface(&m_baseline, value_offset);
+    zero_alc_projection(&m_baseline.alc, m_baseline.config.channels, m_baseline.alc_config.alc_slot_dim, m_baseline.alc_config.alc_key_dim);
+
+    const int delays[] = {0, 2, 6, 12};
+    const int fact_counts[] = {1, 4, 8};
+    const int distractor_sweep[] = {0, 4, 12, 24};
+    int key_dim = m_alc.alc_config.alc_key_dim;
+    int n_trials = 48;
+
+    for (int fi = 0; fi < 3; fi++) {
+        int facts = fact_counts[fi];
+        for (int di = 0; di < 4; di++) {
+            int delay = delays[di];
+            int corr_base = 0, corr_nw = 0, corr_alc = 0, total = 0;
+            for (int e = 0; e < n_trials; e++) {
+                sessionkv_reset_memory(&m_alc); sessionkv_reset_memory(&m_nowrite); sessionkv_reset_memory(&m_baseline);
+                int keys[8], vals[8];
+                for (int j = 0; j < facts; j++) {
+                    keys[j] = (e * 11 + j * 3) % key_dim;
+                    vals[j] = (e * 7 + j * 5 + 1) % value_dim;
+                    float h[32];
+                    sessionkv_build_hidden(h, 32, key_dim, value_offset, value_dim, keys[j], vals[j]);
+                    alc_forward_read_and_fuse(&m_alc, h, 1, 1, 0); alc_write_update(&m_alc, h, 1, 1);
+                    alc_forward_read_and_fuse(&m_nowrite, h, 1, 1, 0); alc_write_update(&m_nowrite, h, 1, 1);
+                    alc_forward_read_and_fuse(&m_baseline, h, 1, 1, 0); alc_write_update(&m_baseline, h, 1, 1);
+                }
+                for (int dd = 0; dd < delay; dd++) {
+                    int dk = (e + dd + 2) % key_dim;
+                    int dv = (e * 13 + dd * 9 + 3) % value_dim;
+                    float h[32];
+                    sessionkv_build_hidden(h, 32, key_dim, value_offset, value_dim, dk, dv);
+                    alc_forward_read_and_fuse(&m_alc, h, 1, 1, 0); alc_write_update(&m_alc, h, 1, 1);
+                    alc_forward_read_and_fuse(&m_nowrite, h, 1, 1, 0); alc_write_update(&m_nowrite, h, 1, 1);
+                    alc_forward_read_and_fuse(&m_baseline, h, 1, 1, 0); alc_write_update(&m_baseline, h, 1, 1);
+                }
+                for (int j = 0; j < facts; j++) {
+                    corr_base += (sessionkv_predict_value(&m_baseline, keys[j], value_offset, value_dim) == vals[j]);
+                    corr_nw += (sessionkv_predict_value(&m_nowrite, keys[j], value_offset, value_dim) == vals[j]);
+                    corr_alc += (sessionkv_predict_value(&m_alc, keys[j], value_offset, value_dim) == vals[j]);
+                    total++;
+                }
+            }
+            fprintf(f, "sessionkv,baseline,delayed_acc_delay_%d_facts_%d,%.8f\n", delay, facts, (float)corr_base / total);
+            fprintf(f, "sessionkv,alc_no_write,delayed_acc_delay_%d_facts_%d,%.8f\n", delay, facts, (float)corr_nw / total);
+            fprintf(f, "sessionkv,alc,delayed_acc_delay_%d_facts_%d,%.8f\n", delay, facts, (float)corr_alc / total);
+        }
+    }
+
+    for (int si = 0; si < 4; si++) {
+        int distractors = distractor_sweep[si];
+        int facts = 4;
+        int corr_base = 0, corr_nw = 0, corr_alc = 0, total = 0;
+        for (int e = 0; e < n_trials; e++) {
+            sessionkv_reset_memory(&m_alc); sessionkv_reset_memory(&m_nowrite); sessionkv_reset_memory(&m_baseline);
+            int keys[4], vals[4];
+            for (int j = 0; j < facts; j++) {
+                keys[j] = (e * 5 + j * 2) % key_dim;
+                vals[j] = (e * 3 + j * 7 + 1) % value_dim;
+                float h[32];
+                sessionkv_build_hidden(h, 32, key_dim, value_offset, value_dim, keys[j], vals[j]);
+                alc_forward_read_and_fuse(&m_alc, h, 1, 1, 0); alc_write_update(&m_alc, h, 1, 1);
+                alc_forward_read_and_fuse(&m_nowrite, h, 1, 1, 0); alc_write_update(&m_nowrite, h, 1, 1);
+                alc_forward_read_and_fuse(&m_baseline, h, 1, 1, 0); alc_write_update(&m_baseline, h, 1, 1);
+            }
+            for (int d = 0; d < distractors; d++) {
+                int dk = (e * 17 + d * 3 + 1) % key_dim;
+                int dv = (e * 19 + d * 5 + 2) % value_dim;
+                float h[32];
+                sessionkv_build_hidden(h, 32, key_dim, value_offset, value_dim, dk, dv);
+                alc_forward_read_and_fuse(&m_alc, h, 1, 1, 0); alc_write_update(&m_alc, h, 1, 1);
+                alc_forward_read_and_fuse(&m_nowrite, h, 1, 1, 0); alc_write_update(&m_nowrite, h, 1, 1);
+                alc_forward_read_and_fuse(&m_baseline, h, 1, 1, 0); alc_write_update(&m_baseline, h, 1, 1);
+            }
+            for (int j = 0; j < facts; j++) {
+                corr_base += (sessionkv_predict_value(&m_baseline, keys[j], value_offset, value_dim) == vals[j]);
+                corr_nw += (sessionkv_predict_value(&m_nowrite, keys[j], value_offset, value_dim) == vals[j]);
+                corr_alc += (sessionkv_predict_value(&m_alc, keys[j], value_offset, value_dim) == vals[j]);
+                total++;
+            }
+        }
+        fprintf(f, "sessionkv,baseline,acc_distractors_%d,%.8f\n", distractors, (float)corr_base / total);
+        fprintf(f, "sessionkv,alc_no_write,acc_distractors_%d,%.8f\n", distractors, (float)corr_nw / total);
+        fprintf(f, "sessionkv,alc,acc_distractors_%d,%.8f\n", distractors, (float)corr_alc / total);
+    }
+
+    int overwrite_total = 0, overwrite_corr[3] = {0}, stale_confuse[3] = {0};
+    for (int e = 0; e < 128; e++) {
+        sessionkv_reset_memory(&m_alc); sessionkv_reset_memory(&m_nowrite); sessionkv_reset_memory(&m_baseline);
+        int k = (e * 7 + 1) % key_dim;
+        int vold = (e * 5 + 2) % value_dim;
+        int vnew = (vold + 3) % value_dim;
+        float h1[32], h2[32];
+        sessionkv_build_hidden(h1, 32, key_dim, value_offset, value_dim, k, vold);
+        sessionkv_build_hidden(h2, 32, key_dim, value_offset, value_dim, k, vnew);
+        alc_forward_read_and_fuse(&m_alc, h1, 1, 1, 0); alc_write_update(&m_alc, h1, 1, 1);
+        alc_forward_read_and_fuse(&m_nowrite, h1, 1, 1, 0); alc_write_update(&m_nowrite, h1, 1, 1);
+        alc_forward_read_and_fuse(&m_baseline, h1, 1, 1, 0); alc_write_update(&m_baseline, h1, 1, 1);
+        for (int d = 0; d < 3; d++) {
+            float hd[32];
+            sessionkv_build_hidden(hd, 32, key_dim, value_offset, value_dim, (k + d + 1) % key_dim, (vold + d + 1) % value_dim);
+            alc_forward_read_and_fuse(&m_alc, hd, 1, 1, 0); alc_write_update(&m_alc, hd, 1, 1);
+            alc_forward_read_and_fuse(&m_nowrite, hd, 1, 1, 0); alc_write_update(&m_nowrite, hd, 1, 1);
+            alc_forward_read_and_fuse(&m_baseline, hd, 1, 1, 0); alc_write_update(&m_baseline, hd, 1, 1);
+        }
+        alc_forward_read_and_fuse(&m_alc, h2, 1, 1, 0); alc_write_update(&m_alc, h2, 1, 1);
+        alc_forward_read_and_fuse(&m_nowrite, h2, 1, 1, 0); alc_write_update(&m_nowrite, h2, 1, 1);
+        alc_forward_read_and_fuse(&m_baseline, h2, 1, 1, 0); alc_write_update(&m_baseline, h2, 1, 1);
+        for (int d = 0; d < 6; d++) {
+            float hd[32];
+            sessionkv_build_hidden(hd, 32, key_dim, value_offset, value_dim, (k + d + 2) % key_dim, (vnew + d + 2) % value_dim);
+            alc_forward_read_and_fuse(&m_alc, hd, 1, 1, 0); alc_write_update(&m_alc, hd, 1, 1);
+            alc_forward_read_and_fuse(&m_nowrite, hd, 1, 1, 0); alc_write_update(&m_nowrite, hd, 1, 1);
+            alc_forward_read_and_fuse(&m_baseline, hd, 1, 1, 0); alc_write_update(&m_baseline, hd, 1, 1);
+        }
+        int p[3];
+        p[0] = sessionkv_predict_value(&m_baseline, k, value_offset, value_dim);
+        p[1] = sessionkv_predict_value(&m_nowrite, k, value_offset, value_dim);
+        p[2] = sessionkv_predict_value(&m_alc, k, value_offset, value_dim);
+        for (int v = 0; v < 3; v++) {
+            overwrite_corr[v] += (p[v] == vnew);
+            stale_confuse[v] += (p[v] == vold);
+        }
+        overwrite_total++;
+    }
+    fprintf(f, "sessionkv,baseline,overwrite_acc,%.8f\n", (float)overwrite_corr[0] / overwrite_total);
+    fprintf(f, "sessionkv,alc_no_write,overwrite_acc,%.8f\n", (float)overwrite_corr[1] / overwrite_total);
+    fprintf(f, "sessionkv,alc,overwrite_acc,%.8f\n", (float)overwrite_corr[2] / overwrite_total);
+    fprintf(f, "sessionkv,baseline,stale_confusion_rate,%.8f\n", (float)stale_confuse[0] / overwrite_total);
+    fprintf(f, "sessionkv,alc_no_write,stale_confusion_rate,%.8f\n", (float)stale_confuse[1] / overwrite_total);
+    fprintf(f, "sessionkv,alc,stale_confusion_rate,%.8f\n", (float)stale_confuse[2] / overwrite_total);
+
+    const int persist_facts = 6;
+    int pkeys[persist_facts], pvals[persist_facts];
+    sessionkv_reset_memory(&m_alc); sessionkv_reset_memory(&m_nowrite); sessionkv_reset_memory(&m_baseline);
+    for (int i = 0; i < persist_facts; i++) {
+        pkeys[i] = (i * 3 + 1) % key_dim;
+        pvals[i] = (i * 5 + 2) % value_dim;
+        float h[32];
+        sessionkv_build_hidden(h, 32, key_dim, value_offset, value_dim, pkeys[i], pvals[i]);
+        alc_forward_read_and_fuse(&m_alc, h, 1, 1, 0); alc_write_update(&m_alc, h, 1, 1);
+        alc_forward_read_and_fuse(&m_nowrite, h, 1, 1, 0); alc_write_update(&m_nowrite, h, 1, 1);
+        alc_forward_read_and_fuse(&m_baseline, h, 1, 1, 0); alc_write_update(&m_baseline, h, 1, 1);
+    }
+
+    GPT2 m_alc_reload, m_nowrite_reload, m_baseline_reload;
+    memset(&m_alc_reload, 0, sizeof(m_alc_reload)); memset(&m_nowrite_reload, 0, sizeof(m_nowrite_reload)); memset(&m_baseline_reload, 0, sizeof(m_baseline_reload));
+    m_alc_reload.config = m_alc.config; m_alc_reload.alc_config = m_alc.alc_config;
+    m_nowrite_reload.config = m_nowrite.config; m_nowrite_reload.alc_config = m_nowrite.alc_config;
+    m_baseline_reload.config = m_baseline.config; m_baseline_reload.alc_config = m_baseline.alc_config;
+    gpt2_init_alc_state(&m_alc_reload, B, T); gpt2_init_alc_state(&m_nowrite_reload, B, T); gpt2_init_alc_state(&m_baseline_reload, B, T);
+    alc_ensure_layer_traces(&m_alc_reload, B, T); alc_ensure_layer_traces(&m_nowrite_reload, B, T); alc_ensure_layer_traces(&m_baseline_reload, B, T);
+    setup_identity_interface(&m_alc_reload, value_offset); setup_identity_interface(&m_nowrite_reload, value_offset); setup_identity_interface(&m_baseline_reload, value_offset);
+    zero_alc_projection(&m_baseline_reload.alc, m_baseline_reload.config.channels, m_baseline_reload.alc_config.alc_slot_dim, m_baseline_reload.alc_config.alc_key_dim);
+
+    char p_alc[512], p_nowrite[512], p_base[512];
+    snprintf(p_alc, sizeof(p_alc), "%s/sessionkv_state_alc.bin", outdir);
+    snprintf(p_nowrite, sizeof(p_nowrite), "%s/sessionkv_state_nowrite.bin", outdir);
+    snprintf(p_base, sizeof(p_base), "%s/sessionkv_state_baseline.bin", outdir);
+    int ok_sa = gpt2_save_alc_state(&m_alc, p_alc), ok_sn = gpt2_save_alc_state(&m_nowrite, p_nowrite), ok_sb = gpt2_save_alc_state(&m_baseline, p_base);
+    int ok_la = gpt2_load_alc_state(&m_alc_reload, p_alc, B, T), ok_ln = gpt2_load_alc_state(&m_nowrite_reload, p_nowrite, B, T), ok_lb = gpt2_load_alc_state(&m_baseline_reload, p_base, B, T);
+    size_t nslots = (size_t)m_alc.alc_config.alc_num_slots * m_alc.alc_config.alc_slot_dim;
+    float slot_diff_alc = max_abs_diff_local(m_alc.alc.slots, m_alc_reload.alc.slots, nslots);
+    int p_corr[3] = {0};
+    for (int i = 0; i < persist_facts; i++) {
+        p_corr[0] += (sessionkv_predict_value(&m_baseline_reload, pkeys[i], value_offset, value_dim) == pvals[i]);
+        p_corr[1] += (sessionkv_predict_value(&m_nowrite_reload, pkeys[i], value_offset, value_dim) == pvals[i]);
+        p_corr[2] += (sessionkv_predict_value(&m_alc_reload, pkeys[i], value_offset, value_dim) == pvals[i]);
+    }
+    float qa[32], qb[32];
+    sessionkv_build_query(qa, 32, key_dim, pkeys[0]);
+    memcpy(qb, qa, sizeof(qa));
+    alc_forward_read_and_fuse(&m_alc, qa, 1, 1, 0);
+    alc_forward_read_and_fuse(&m_alc_reload, qb, 1, 1, 0);
+    float behavior_diff = max_abs_diff_local(qa, qb, 32);
+    fprintf(f, "sessionkv,baseline,persistence_recall_acc,%.8f\n", (float)p_corr[0] / persist_facts);
+    fprintf(f, "sessionkv,alc_no_write,persistence_recall_acc,%.8f\n", (float)p_corr[1] / persist_facts);
+    fprintf(f, "sessionkv,alc,persistence_recall_acc,%.8f\n", (float)p_corr[2] / persist_facts);
+    fprintf(f, "sessionkv,baseline,persistence_save_ok,%.8f\n", (float)ok_sb);
+    fprintf(f, "sessionkv,baseline,persistence_load_ok,%.8f\n", (float)ok_lb);
+    fprintf(f, "sessionkv,alc_no_write,persistence_save_ok,%.8f\n", (float)ok_sn);
+    fprintf(f, "sessionkv,alc_no_write,persistence_load_ok,%.8f\n", (float)ok_ln);
+    fprintf(f, "sessionkv,alc,persistence_save_ok,%.8f\n", (float)ok_sa);
+    fprintf(f, "sessionkv,alc,persistence_load_ok,%.8f\n", (float)ok_la);
+    fprintf(f, "sessionkv,alc,persistence_slot_max_abs_diff,%.8f\n", slot_diff_alc);
+    fprintf(f, "sessionkv,alc,persistence_behavior_max_abs_diff,%.8f\n", behavior_diff);
+
+    gpt2_free(&m_alc); gpt2_free(&m_nowrite); gpt2_free(&m_baseline);
+    gpt2_free(&m_alc_reload); gpt2_free(&m_nowrite_reload); gpt2_free(&m_baseline_reload);
+}
+
 static double now_s(void) {
     struct timespec ts;
     clock_gettime(CLOCK_MONOTONIC, &ts);
@@ -686,6 +935,7 @@ int main(int argc, char** argv) {
     run_persistence(f, outdir);
     run_trainability(f);
     run_language_shaped_benchmark(f);
+    run_sessionkv_benchmark(f, outdir);
     run_tinyqa(f);
     run_ablations(f);
     run_efficiency(f);

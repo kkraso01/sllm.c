@@ -123,4 +123,36 @@ for (variant, delay), vals in sorted(tinyqa_by_key.items()):
     }
 
 (OUT / 'tinyqa_summary.json').write_text(json.dumps(tinyqa_summary, indent=2))
+
+# SessionKV-DR focused exports for primary paper tables.
+sessionkv_rows = []
+for r in all_rows:
+    if r['experiment'] != 'sessionkv':
+        continue
+    sessionkv_rows.append({
+        'seed': int(r['seed']),
+        'variant': r['variant'],
+        'metric': r['metric'],
+        'value': float(r['value']),
+    })
+
+with (OUT / 'sessionkv_results.csv').open('w', newline='') as f:
+    w = csv.DictWriter(f, fieldnames=['seed', 'variant', 'metric', 'value'])
+    w.writeheader()
+    for r in sorted(sessionkv_rows, key=lambda x: (x['metric'], x['variant'], x['seed'])):
+        w.writerow(r)
+
+sessionkv_summary = {}
+sessionkv_by_key = defaultdict(list)
+for r in sessionkv_rows:
+    sessionkv_by_key[(r['variant'], r['metric'])].append(r['value'])
+for (variant, metric), vals in sorted(sessionkv_by_key.items()):
+    sessionkv_summary.setdefault(variant, {})[metric] = {
+        'n_seeds': len(vals),
+        'mean': mean(vals),
+        'std': std_sample(vals),
+        'ci95': ci95(vals),
+        'values': vals,
+    }
+(OUT / 'sessionkv_summary.json').write_text(json.dumps(sessionkv_summary, indent=2))
 print(f'Wrote multi-seed outputs for {len(SEEDS)} seeds to {OUT}')

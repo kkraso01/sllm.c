@@ -799,41 +799,41 @@
     },
     "alc::forward_ms": {
       "n_seeds": 5,
-      "mean": 0.6992564760000001,
-      "std": 0.11020263244229277,
-      "ci95": 0.09659686635663299,
+      "mean": 1.109160536,
+      "std": 0.255603362793546,
+      "ci95": 0.22404622583769246,
       "values": [
-        0.88336432,
-        0.71267338,
-        0.61502964,
-        0.66486062,
-        0.62035442
+        0.70031528,
+        1.0669087,
+        1.28382576,
+        1.13857062,
+        1.35618232
       ]
     },
     "alc::slowdown_ratio": {
       "n_seeds": 5,
-      "mean": 1.156940444,
-      "std": 0.28530776517022677,
-      "ci95": 0.25008328251223616,
+      "mean": 1.821173658,
+      "std": 0.44423264485190767,
+      "ci95": 0.3893870815516479,
       "values": [
-        1.59441072,
-        1.24530978,
-        1.00911408,
-        0.83926164,
-        1.096606
+        1.09966887,
+        1.7115119,
+        2.2089786,
+        1.9792216,
+        2.10648732
       ]
     },
     "baseline::forward_ms": {
       "n_seeds": 5,
-      "mean": 0.618740016,
-      "std": 0.09915936982943913,
-      "ci95": 0.08691701988550969,
+      "mean": 0.612094664,
+      "std": 0.03184989731658612,
+      "ci95": 0.027917665906699685,
       "values": [
-        0.55403812,
-        0.57228602,
-        0.60947484,
-        0.79219708,
-        0.56570402
+        0.63684196,
+        0.62337206,
+        0.58118524,
+        0.57526182,
+        0.64381224
       ]
     }
   },
@@ -968,6 +968,853 @@
         0.0,
         0.0,
         0.0
+      ]
+    }
+  },
+  "sessionkv": {
+    "alc::acc_distractors_0": {
+      "n_seeds": 5,
+      "mean": 1.0,
+      "std": 0.0,
+      "ci95": 0.0,
+      "values": [
+        1.0,
+        1.0,
+        1.0,
+        1.0,
+        1.0
+      ]
+    },
+    "alc::acc_distractors_12": {
+      "n_seeds": 5,
+      "mean": 0.34375,
+      "std": 0.0,
+      "ci95": 0.0,
+      "values": [
+        0.34375,
+        0.34375,
+        0.34375,
+        0.34375,
+        0.34375
+      ]
+    },
+    "alc::acc_distractors_24": {
+      "n_seeds": 5,
+      "mean": 0.125,
+      "std": 0.0,
+      "ci95": 0.0,
+      "values": [
+        0.125,
+        0.125,
+        0.125,
+        0.125,
+        0.125
+      ]
+    },
+    "alc::acc_distractors_4": {
+      "n_seeds": 5,
+      "mean": 0.84375,
+      "std": 0.0,
+      "ci95": 0.0,
+      "values": [
+        0.84375,
+        0.84375,
+        0.84375,
+        0.84375,
+        0.84375
+      ]
+    },
+    "alc::delayed_acc_delay_0_facts_1": {
+      "n_seeds": 5,
+      "mean": 1.0,
+      "std": 0.0,
+      "ci95": 0.0,
+      "values": [
+        1.0,
+        1.0,
+        1.0,
+        1.0,
+        1.0
+      ]
+    },
+    "alc::delayed_acc_delay_0_facts_4": {
+      "n_seeds": 5,
+      "mean": 1.0,
+      "std": 0.0,
+      "ci95": 0.0,
+      "values": [
+        1.0,
+        1.0,
+        1.0,
+        1.0,
+        1.0
+      ]
+    },
+    "alc::delayed_acc_delay_0_facts_8": {
+      "n_seeds": 5,
+      "mean": 1.0,
+      "std": 0.0,
+      "ci95": 0.0,
+      "values": [
+        1.0,
+        1.0,
+        1.0,
+        1.0,
+        1.0
+      ]
+    },
+    "alc::delayed_acc_delay_12_facts_1": {
+      "n_seeds": 5,
+      "mean": 1.0,
+      "std": 0.0,
+      "ci95": 0.0,
+      "values": [
+        1.0,
+        1.0,
+        1.0,
+        1.0,
+        1.0
+      ]
+    },
+    "alc::delayed_acc_delay_12_facts_4": {
+      "n_seeds": 5,
+      "mean": 0.46875,
+      "std": 0.0,
+      "ci95": 0.0,
+      "values": [
+        0.46875,
+        0.46875,
+        0.46875,
+        0.46875,
+        0.46875
+      ]
+    },
+    "alc::delayed_acc_delay_12_facts_8": {
+      "n_seeds": 5,
+      "mean": 0.4375,
+      "std": 0.0,
+      "ci95": 0.0,
+      "values": [
+        0.4375,
+        0.4375,
+        0.4375,
+        0.4375,
+        0.4375
+      ]
+    },
+    "alc::delayed_acc_delay_2_facts_1": {
+      "n_seeds": 5,
+      "mean": 1.0,
+      "std": 0.0,
+      "ci95": 0.0,
+      "values": [
+        1.0,
+        1.0,
+        1.0,
+        1.0,
+        1.0
+      ]
+    },
+    "alc::delayed_acc_delay_2_facts_4": {
+      "n_seeds": 5,
+      "mean": 0.875,
+      "std": 0.0,
+      "ci95": 0.0,
+      "values": [
+        0.875,
+        0.875,
+        0.875,
+        0.875,
+        0.875
+      ]
+    },
+    "alc::delayed_acc_delay_2_facts_8": {
+      "n_seeds": 5,
+      "mean": 0.90625,
+      "std": 0.0,
+      "ci95": 0.0,
+      "values": [
+        0.90625,
+        0.90625,
+        0.90625,
+        0.90625,
+        0.90625
+      ]
+    },
+    "alc::delayed_acc_delay_6_facts_1": {
+      "n_seeds": 5,
+      "mean": 1.0,
+      "std": 0.0,
+      "ci95": 0.0,
+      "values": [
+        1.0,
+        1.0,
+        1.0,
+        1.0,
+        1.0
+      ]
+    },
+    "alc::delayed_acc_delay_6_facts_4": {
+      "n_seeds": 5,
+      "mean": 0.71875,
+      "std": 0.0,
+      "ci95": 0.0,
+      "values": [
+        0.71875,
+        0.71875,
+        0.71875,
+        0.71875,
+        0.71875
+      ]
+    },
+    "alc::delayed_acc_delay_6_facts_8": {
+      "n_seeds": 5,
+      "mean": 0.71875,
+      "std": 0.0,
+      "ci95": 0.0,
+      "values": [
+        0.71875,
+        0.71875,
+        0.71875,
+        0.71875,
+        0.71875
+      ]
+    },
+    "alc::overwrite_acc": {
+      "n_seeds": 5,
+      "mean": 0.375,
+      "std": 0.0,
+      "ci95": 0.0,
+      "values": [
+        0.375,
+        0.375,
+        0.375,
+        0.375,
+        0.375
+      ]
+    },
+    "alc::persistence_behavior_max_abs_diff": {
+      "n_seeds": 5,
+      "mean": 0.0,
+      "std": 0.0,
+      "ci95": 0.0,
+      "values": [
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0
+      ]
+    },
+    "alc::persistence_load_ok": {
+      "n_seeds": 5,
+      "mean": 1.0,
+      "std": 0.0,
+      "ci95": 0.0,
+      "values": [
+        1.0,
+        1.0,
+        1.0,
+        1.0,
+        1.0
+      ]
+    },
+    "alc::persistence_recall_acc": {
+      "n_seeds": 5,
+      "mean": 1.0,
+      "std": 0.0,
+      "ci95": 0.0,
+      "values": [
+        1.0,
+        1.0,
+        1.0,
+        1.0,
+        1.0
+      ]
+    },
+    "alc::persistence_save_ok": {
+      "n_seeds": 5,
+      "mean": 1.0,
+      "std": 0.0,
+      "ci95": 0.0,
+      "values": [
+        1.0,
+        1.0,
+        1.0,
+        1.0,
+        1.0
+      ]
+    },
+    "alc::persistence_slot_max_abs_diff": {
+      "n_seeds": 5,
+      "mean": 0.0,
+      "std": 0.0,
+      "ci95": 0.0,
+      "values": [
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0
+      ]
+    },
+    "alc::stale_confusion_rate": {
+      "n_seeds": 5,
+      "mean": 0.625,
+      "std": 0.0,
+      "ci95": 0.0,
+      "values": [
+        0.625,
+        0.625,
+        0.625,
+        0.625,
+        0.625
+      ]
+    },
+    "alc_no_write::acc_distractors_0": {
+      "n_seeds": 5,
+      "mean": 0.125,
+      "std": 0.0,
+      "ci95": 0.0,
+      "values": [
+        0.125,
+        0.125,
+        0.125,
+        0.125,
+        0.125
+      ]
+    },
+    "alc_no_write::acc_distractors_12": {
+      "n_seeds": 5,
+      "mean": 0.125,
+      "std": 0.0,
+      "ci95": 0.0,
+      "values": [
+        0.125,
+        0.125,
+        0.125,
+        0.125,
+        0.125
+      ]
+    },
+    "alc_no_write::acc_distractors_24": {
+      "n_seeds": 5,
+      "mean": 0.125,
+      "std": 0.0,
+      "ci95": 0.0,
+      "values": [
+        0.125,
+        0.125,
+        0.125,
+        0.125,
+        0.125
+      ]
+    },
+    "alc_no_write::acc_distractors_4": {
+      "n_seeds": 5,
+      "mean": 0.125,
+      "std": 0.0,
+      "ci95": 0.0,
+      "values": [
+        0.125,
+        0.125,
+        0.125,
+        0.125,
+        0.125
+      ]
+    },
+    "alc_no_write::delayed_acc_delay_0_facts_1": {
+      "n_seeds": 5,
+      "mean": 0.125,
+      "std": 0.0,
+      "ci95": 0.0,
+      "values": [
+        0.125,
+        0.125,
+        0.125,
+        0.125,
+        0.125
+      ]
+    },
+    "alc_no_write::delayed_acc_delay_0_facts_4": {
+      "n_seeds": 5,
+      "mean": 0.125,
+      "std": 0.0,
+      "ci95": 0.0,
+      "values": [
+        0.125,
+        0.125,
+        0.125,
+        0.125,
+        0.125
+      ]
+    },
+    "alc_no_write::delayed_acc_delay_0_facts_8": {
+      "n_seeds": 5,
+      "mean": 0.125,
+      "std": 0.0,
+      "ci95": 0.0,
+      "values": [
+        0.125,
+        0.125,
+        0.125,
+        0.125,
+        0.125
+      ]
+    },
+    "alc_no_write::delayed_acc_delay_12_facts_1": {
+      "n_seeds": 5,
+      "mean": 0.125,
+      "std": 0.0,
+      "ci95": 0.0,
+      "values": [
+        0.125,
+        0.125,
+        0.125,
+        0.125,
+        0.125
+      ]
+    },
+    "alc_no_write::delayed_acc_delay_12_facts_4": {
+      "n_seeds": 5,
+      "mean": 0.125,
+      "std": 0.0,
+      "ci95": 0.0,
+      "values": [
+        0.125,
+        0.125,
+        0.125,
+        0.125,
+        0.125
+      ]
+    },
+    "alc_no_write::delayed_acc_delay_12_facts_8": {
+      "n_seeds": 5,
+      "mean": 0.125,
+      "std": 0.0,
+      "ci95": 0.0,
+      "values": [
+        0.125,
+        0.125,
+        0.125,
+        0.125,
+        0.125
+      ]
+    },
+    "alc_no_write::delayed_acc_delay_2_facts_1": {
+      "n_seeds": 5,
+      "mean": 0.125,
+      "std": 0.0,
+      "ci95": 0.0,
+      "values": [
+        0.125,
+        0.125,
+        0.125,
+        0.125,
+        0.125
+      ]
+    },
+    "alc_no_write::delayed_acc_delay_2_facts_4": {
+      "n_seeds": 5,
+      "mean": 0.125,
+      "std": 0.0,
+      "ci95": 0.0,
+      "values": [
+        0.125,
+        0.125,
+        0.125,
+        0.125,
+        0.125
+      ]
+    },
+    "alc_no_write::delayed_acc_delay_2_facts_8": {
+      "n_seeds": 5,
+      "mean": 0.125,
+      "std": 0.0,
+      "ci95": 0.0,
+      "values": [
+        0.125,
+        0.125,
+        0.125,
+        0.125,
+        0.125
+      ]
+    },
+    "alc_no_write::delayed_acc_delay_6_facts_1": {
+      "n_seeds": 5,
+      "mean": 0.125,
+      "std": 0.0,
+      "ci95": 0.0,
+      "values": [
+        0.125,
+        0.125,
+        0.125,
+        0.125,
+        0.125
+      ]
+    },
+    "alc_no_write::delayed_acc_delay_6_facts_4": {
+      "n_seeds": 5,
+      "mean": 0.125,
+      "std": 0.0,
+      "ci95": 0.0,
+      "values": [
+        0.125,
+        0.125,
+        0.125,
+        0.125,
+        0.125
+      ]
+    },
+    "alc_no_write::delayed_acc_delay_6_facts_8": {
+      "n_seeds": 5,
+      "mean": 0.125,
+      "std": 0.0,
+      "ci95": 0.0,
+      "values": [
+        0.125,
+        0.125,
+        0.125,
+        0.125,
+        0.125
+      ]
+    },
+    "alc_no_write::overwrite_acc": {
+      "n_seeds": 5,
+      "mean": 0.125,
+      "std": 0.0,
+      "ci95": 0.0,
+      "values": [
+        0.125,
+        0.125,
+        0.125,
+        0.125,
+        0.125
+      ]
+    },
+    "alc_no_write::persistence_load_ok": {
+      "n_seeds": 5,
+      "mean": 1.0,
+      "std": 0.0,
+      "ci95": 0.0,
+      "values": [
+        1.0,
+        1.0,
+        1.0,
+        1.0,
+        1.0
+      ]
+    },
+    "alc_no_write::persistence_recall_acc": {
+      "n_seeds": 5,
+      "mean": 0.0,
+      "std": 0.0,
+      "ci95": 0.0,
+      "values": [
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0
+      ]
+    },
+    "alc_no_write::persistence_save_ok": {
+      "n_seeds": 5,
+      "mean": 1.0,
+      "std": 0.0,
+      "ci95": 0.0,
+      "values": [
+        1.0,
+        1.0,
+        1.0,
+        1.0,
+        1.0
+      ]
+    },
+    "alc_no_write::stale_confusion_rate": {
+      "n_seeds": 5,
+      "mean": 0.125,
+      "std": 0.0,
+      "ci95": 0.0,
+      "values": [
+        0.125,
+        0.125,
+        0.125,
+        0.125,
+        0.125
+      ]
+    },
+    "baseline::acc_distractors_0": {
+      "n_seeds": 5,
+      "mean": 0.125,
+      "std": 0.0,
+      "ci95": 0.0,
+      "values": [
+        0.125,
+        0.125,
+        0.125,
+        0.125,
+        0.125
+      ]
+    },
+    "baseline::acc_distractors_12": {
+      "n_seeds": 5,
+      "mean": 0.125,
+      "std": 0.0,
+      "ci95": 0.0,
+      "values": [
+        0.125,
+        0.125,
+        0.125,
+        0.125,
+        0.125
+      ]
+    },
+    "baseline::acc_distractors_24": {
+      "n_seeds": 5,
+      "mean": 0.125,
+      "std": 0.0,
+      "ci95": 0.0,
+      "values": [
+        0.125,
+        0.125,
+        0.125,
+        0.125,
+        0.125
+      ]
+    },
+    "baseline::acc_distractors_4": {
+      "n_seeds": 5,
+      "mean": 0.125,
+      "std": 0.0,
+      "ci95": 0.0,
+      "values": [
+        0.125,
+        0.125,
+        0.125,
+        0.125,
+        0.125
+      ]
+    },
+    "baseline::delayed_acc_delay_0_facts_1": {
+      "n_seeds": 5,
+      "mean": 0.125,
+      "std": 0.0,
+      "ci95": 0.0,
+      "values": [
+        0.125,
+        0.125,
+        0.125,
+        0.125,
+        0.125
+      ]
+    },
+    "baseline::delayed_acc_delay_0_facts_4": {
+      "n_seeds": 5,
+      "mean": 0.125,
+      "std": 0.0,
+      "ci95": 0.0,
+      "values": [
+        0.125,
+        0.125,
+        0.125,
+        0.125,
+        0.125
+      ]
+    },
+    "baseline::delayed_acc_delay_0_facts_8": {
+      "n_seeds": 5,
+      "mean": 0.125,
+      "std": 0.0,
+      "ci95": 0.0,
+      "values": [
+        0.125,
+        0.125,
+        0.125,
+        0.125,
+        0.125
+      ]
+    },
+    "baseline::delayed_acc_delay_12_facts_1": {
+      "n_seeds": 5,
+      "mean": 0.125,
+      "std": 0.0,
+      "ci95": 0.0,
+      "values": [
+        0.125,
+        0.125,
+        0.125,
+        0.125,
+        0.125
+      ]
+    },
+    "baseline::delayed_acc_delay_12_facts_4": {
+      "n_seeds": 5,
+      "mean": 0.125,
+      "std": 0.0,
+      "ci95": 0.0,
+      "values": [
+        0.125,
+        0.125,
+        0.125,
+        0.125,
+        0.125
+      ]
+    },
+    "baseline::delayed_acc_delay_12_facts_8": {
+      "n_seeds": 5,
+      "mean": 0.125,
+      "std": 0.0,
+      "ci95": 0.0,
+      "values": [
+        0.125,
+        0.125,
+        0.125,
+        0.125,
+        0.125
+      ]
+    },
+    "baseline::delayed_acc_delay_2_facts_1": {
+      "n_seeds": 5,
+      "mean": 0.125,
+      "std": 0.0,
+      "ci95": 0.0,
+      "values": [
+        0.125,
+        0.125,
+        0.125,
+        0.125,
+        0.125
+      ]
+    },
+    "baseline::delayed_acc_delay_2_facts_4": {
+      "n_seeds": 5,
+      "mean": 0.125,
+      "std": 0.0,
+      "ci95": 0.0,
+      "values": [
+        0.125,
+        0.125,
+        0.125,
+        0.125,
+        0.125
+      ]
+    },
+    "baseline::delayed_acc_delay_2_facts_8": {
+      "n_seeds": 5,
+      "mean": 0.125,
+      "std": 0.0,
+      "ci95": 0.0,
+      "values": [
+        0.125,
+        0.125,
+        0.125,
+        0.125,
+        0.125
+      ]
+    },
+    "baseline::delayed_acc_delay_6_facts_1": {
+      "n_seeds": 5,
+      "mean": 0.125,
+      "std": 0.0,
+      "ci95": 0.0,
+      "values": [
+        0.125,
+        0.125,
+        0.125,
+        0.125,
+        0.125
+      ]
+    },
+    "baseline::delayed_acc_delay_6_facts_4": {
+      "n_seeds": 5,
+      "mean": 0.125,
+      "std": 0.0,
+      "ci95": 0.0,
+      "values": [
+        0.125,
+        0.125,
+        0.125,
+        0.125,
+        0.125
+      ]
+    },
+    "baseline::delayed_acc_delay_6_facts_8": {
+      "n_seeds": 5,
+      "mean": 0.125,
+      "std": 0.0,
+      "ci95": 0.0,
+      "values": [
+        0.125,
+        0.125,
+        0.125,
+        0.125,
+        0.125
+      ]
+    },
+    "baseline::overwrite_acc": {
+      "n_seeds": 5,
+      "mean": 0.125,
+      "std": 0.0,
+      "ci95": 0.0,
+      "values": [
+        0.125,
+        0.125,
+        0.125,
+        0.125,
+        0.125
+      ]
+    },
+    "baseline::persistence_load_ok": {
+      "n_seeds": 5,
+      "mean": 1.0,
+      "std": 0.0,
+      "ci95": 0.0,
+      "values": [
+        1.0,
+        1.0,
+        1.0,
+        1.0,
+        1.0
+      ]
+    },
+    "baseline::persistence_recall_acc": {
+      "n_seeds": 5,
+      "mean": 0.0,
+      "std": 0.0,
+      "ci95": 0.0,
+      "values": [
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0
+      ]
+    },
+    "baseline::persistence_save_ok": {
+      "n_seeds": 5,
+      "mean": 1.0,
+      "std": 0.0,
+      "ci95": 0.0,
+      "values": [
+        1.0,
+        1.0,
+        1.0,
+        1.0,
+        1.0
+      ]
+    },
+    "baseline::stale_confusion_rate": {
+      "n_seeds": 5,
+      "mean": 0.125,
+      "std": 0.0,
+      "ci95": 0.0,
+      "values": [
+        0.125,
+        0.125,
+        0.125,
+        0.125,
+        0.125
       ]
     }
   },

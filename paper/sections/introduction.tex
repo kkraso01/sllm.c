@@ -1,6 +1,6 @@
 \section{Introduction}
-Many deployment settings need adaptation to newly observed information at inference time, while preserving constraints that discourage direct post-deployment weight updates. We study whether an explicit mutable memory module can provide useful adaptation under these constraints.
+Many deployed settings require incorporating newly observed information during inference without post-deployment weight updates. Adaptive memory modules are one approach, but evaluation must match that claim directly.
 
-This paper reports a final pre-submission strengthening pass for the finalized Adaptive Learning Component (ALC) implementation in \texttt{llm.c}. ALC augments a transformer block with slot/key memory, differentiable routing, routing-weighted updates, and explicit save/load semantics.
+This pass keeps the ALC mechanism fixed and focuses on claim-aligned evidence. Our main contribution here is benchmarking and packaging: we introduce SessionKV-DR, a benchmark that explicitly tests write, retention under delay/interference, retrieval, overwrite/update behavior, and persistence across save/reload. We report baseline, ALC no-write, and full ALC side-by-side with multi-seed aggregation.
 
-The contribution of this pass is empirical and packaging-focused: (i) multi-seed robustness reporting, (ii) a stronger baseline comparison beyond plain baseline (ALC no-write), (iii) one additional semi-realistic language-shaped delayed-recall benchmark, and (iv) tighter evidence-disciplined writing for workshop/arXiv readiness. We intentionally avoid adding new core architecture features in this pass.
+We retain TinyQA and prior diagnostics, but reposition them as supporting evidence. The primary question is not generic QA quality; it is whether structured inference-time memory writes causally improve delayed session-specific recall and update behavior.
