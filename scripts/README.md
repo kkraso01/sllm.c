@@ -41,3 +41,7 @@ mpirun -np 16 --host node1:8,node2:8 ./train_gptcu ...
 ```
 
 For PyTorch follow the torchrun docs.
+
+## local reproducibility helpers
+
+For laptop-friendly ALC build/test/demo/sessionkv/persistence flows, use scripts under `scripts/local/` and see `RUN_LOCAL.md`.
