@@ -1,0 +1,9 @@
+\section{Experimental Setup}
+We run a synthetic, deterministic experiment suite directly against the finalized C ALC implementation. Experiments include core adaptation, long-run stability, persistence round-trip, trainability, ablations, and efficiency.
+
+All experiments are generated via:
+\begin{verbatim}
+./scripts/run_alc_publication_suite.sh
+\end{verbatim}
+
+Primary outputs are written to \texttt{paper/results/metrics.csv} and summarized into tables under \texttt{paper/tables/}.

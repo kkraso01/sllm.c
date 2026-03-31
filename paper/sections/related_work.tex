@@ -1,0 +1,4 @@
+\section{Related Work}
+Memory-augmented transformer work spans recurrent activation memory (Transformer-XL, Compressive Transformer), memory tokens (RMT), and nearest-neighbor memory systems (kNN-LM, Memorizing Transformers). Retrieval-based systems such as RAG and RETRO improve factual access through external corpora, while test-time adaptation methods (e.g., TTT, TENT/TPT families) adapt parameters or prompts during inference.
+
+ALC differs by focusing on \emph{in-model mutable state} with explicit read/write operators, differentiable routing, and persistence as a runtime contract. This places ALC closer to controllable state adaptation than to large external retrieval systems. We avoid claiming broad superiority on long-context or open-domain knowledge benchmarks; current evidence supports mechanism-level adaptation and stability in controlled settings.
