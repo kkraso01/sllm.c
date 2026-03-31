@@ -1,0 +1,49 @@
+\section{Results}
+We treat SessionKV-DR as the main evidence because it directly measures the intended mechanism. Delayed recall, overwrite, persistence, and capacity slices are all reported with baseline/no-write/full variants.
+
+Performance gains for full ALC over baseline indicate effective inference-time state updates in this setup. Cases where no-write remains competitive are retained as important diagnostics, suggesting that routing/write policy robustness is not fully solved.
+
+TinyQA outcomes are supportive and are interpreted as secondary to the mechanism-focused benchmark.
+
+\subsection{Primary evidence: SessionKV-DR}
+\begin{table}[h]
+\centering
+\begin{tabular}{llll}
+\toprule
+\input{tables/sessionkv_main.tex}
+\bottomrule
+\end{tabular}
+\caption{SessionKV-DR delayed recall (mean $\pm$ std, 95\% CI, n=5).}
+\end{table}
+
+\begin{table}[h]
+\centering
+\begin{tabular}{llll}
+\toprule
+\input{tables/sessionkv_overwrite.tex}
+\bottomrule
+\end{tabular}
+\caption{SessionKV-DR overwrite and persistence metrics (mean $\pm$ std, 95\% CI, n=5 where available).}
+\end{table}
+
+\begin{table}[h]
+\centering
+\begin{tabular}{llll}
+\toprule
+\input{tables/sessionkv_capacity.tex}
+\bottomrule
+\end{tabular}
+\caption{SessionKV-DR capacity/interference sweep.}
+\end{table}
+
+\subsection{Supporting evidence: TinyQA}
+\begin{table}[h]
+\centering
+\begin{tabular}{llll}
+\toprule
+\input{tables/tinyqa_results.tex}
+\bottomrule
+\end{tabular}
+\caption{TinyQA delayed QA accuracy (supporting evidence only).}
+\end{table}
+

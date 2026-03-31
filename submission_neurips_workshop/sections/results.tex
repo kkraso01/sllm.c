@@ -1,0 +1,49 @@
+\section{Results}
+SessionKV-DR provides the core empirical evidence. Its design links success directly to session memory operations, making it suitable for mechanism validation.
+
+Across multi-seed comparisons, full ALC improves delayed session recall relative to baseline controls in the reported slices. Competitive no-write cases are kept to show where write decisions and interference remain limiting factors.
+
+TinyQA serves as a secondary check and is interpreted conservatively.
+
+\subsection{Primary evidence: SessionKV-DR}
+\begin{table}[h]
+\centering
+\begin{tabular}{llll}
+\toprule
+\input{tables/sessionkv_main.tex}
+\bottomrule
+\end{tabular}
+\caption{SessionKV-DR delayed recall (mean $\pm$ std, 95\% CI, n=5).}
+\end{table}
+
+\begin{table}[h]
+\centering
+\begin{tabular}{llll}
+\toprule
+\input{tables/sessionkv_overwrite.tex}
+\bottomrule
+\end{tabular}
+\caption{SessionKV-DR overwrite and persistence metrics (mean $\pm$ std, 95\% CI, n=5 where available).}
+\end{table}
+
+\begin{table}[h]
+\centering
+\begin{tabular}{llll}
+\toprule
+\input{tables/sessionkv_capacity.tex}
+\bottomrule
+\end{tabular}
+\caption{SessionKV-DR capacity/interference sweep.}
+\end{table}
+
+\subsection{Supporting evidence: TinyQA}
+\begin{table}[h]
+\centering
+\begin{tabular}{llll}
+\toprule
+\input{tables/tinyqa_results.tex}
+\bottomrule
+\end{tabular}
+\caption{TinyQA delayed QA accuracy (supporting evidence only).}
+\end{table}
+
