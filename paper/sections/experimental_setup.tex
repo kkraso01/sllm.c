@@ -1,9 +1,18 @@
 \section{Experimental Setup}
-We run a synthetic, deterministic experiment suite directly against the finalized C ALC implementation. Experiments include core adaptation, long-run stability, persistence round-trip, trainability, ablations, and efficiency.
+We run a deterministic synthetic-mechanism suite directly against the finalized C ALC implementation, now extended with multi-seed execution and one language-shaped delayed recall task.
 
-All experiments are generated via:
+Experiments include: core adaptation, stability stress test, persistence round-trip, trainability, language-shaped delayed recall with distractors, ablations, and tiny-setup efficiency.
+
+Baselines include:
+\begin{itemize}
+  \item \textbf{Baseline (stale-memory query):} query before writing current fact.
+  \item \textbf{ALC full:} standard read + write updates.
+  \item \textbf{ALC no-write:} read interface active but writes disabled.
+\end{itemize}
+
+All artifacts are generated via:
 \begin{verbatim}
 ./scripts/run_alc_publication_suite.sh
 \end{verbatim}
 
-Primary outputs are written to \texttt{paper/results/metrics.csv} and summarized into tables under \texttt{paper/tables/}.
+Multi-seed execution uses 5 seeds (42, 1337, 2027, 31415, 27182) and reports mean, sample standard deviation, and 95\% confidence intervals. Outputs are written to \texttt{paper/results/metrics.csv}, \texttt{paper/results/multiseed\_summary.csv}, and \texttt{paper/results/multiseed\_summary.json}.

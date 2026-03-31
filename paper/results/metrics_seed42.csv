@@ -76,7 +76,7 @@ ablation,S16_eta0.50_softmax_additive,recall_mse,0.32224029
 ablation,S16_eta0.50_softmax_gated,recall_mse,0.38031751
 ablation,S16_eta0.50_topk_softmax_additive,recall_mse,0.27220148
 ablation,S16_eta0.50_topk_softmax_gated,recall_mse,0.33561039
-efficiency,baseline,forward_ms,0.58529412
-efficiency,alc,forward_ms,0.59985604
-efficiency,alc,slowdown_ratio,1.02487966
+efficiency,baseline,forward_ms,0.48678664
+efficiency,alc,forward_ms,0.53168628
+efficiency,alc,slowdown_ratio,1.09223680
 efficiency,alc,extra_params,992.00000000

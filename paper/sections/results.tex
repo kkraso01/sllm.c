@@ -1,26 +1,29 @@
 \section{Results}
-\subsection{Main results}
+\subsection{Main results (multi-seed where available)}
 \begin{table}[h]
 \centering
 \begin{tabular}{ll}
 \toprule
-Metric & Value \\
-\midrule
-Core recall MSE (baseline) & 0.8795 \\
-Core recall MSE (ALC) & 0.6307 \\
-Core recall accuracy (baseline) & 0.0156 \\
-Core recall accuracy (ALC) & 0.1406 \\
-Stability NaN rate (10k updates) & 0.0000 \\
-Persistence behavior max diff & 0.0 \\
-Trainability loss (before $\rightarrow$ after) & 0.0942 $\rightarrow$ 0.0755 \\
-Forward-time slowdown (tiny CPU setup) & 1.14$\times$ \\
+\input{tables/main_results.tex}
 \bottomrule
 \end{tabular}
-\caption{Summary of ALC publication-pass results.}
+\caption{Main results. Multi-seed entries report mean $\pm$ std and 95\% CI (n=5). Persistence and efficiency remain single-reference-run in this pass.}
 \end{table}
 
 \subsection{Interpretation}
-ALC improves adaptation metrics on the delayed-recall task and remains stable under repeated updates. Persistence is exact in this setup. Interface optimization reduces supervised retrieval loss, supporting the utility of learnable read/fusion mappings. Runtime overhead is measurable but moderate in the tested configuration.
+ALC improves over the stale-memory baseline on core adaptation and on the added language-shaped delayed-recall benchmark. Stability remains strong in this suite (no NaN events across 10k-step stress runs in all seeds), and persistence round-trip remains exact in the reference run. Trainability improvements are consistent across seeds.
+
+However, the no-write control is competitive and in some metrics stronger than full ALC, indicating that write-policy/interference remains an open issue. Therefore we frame evidence as mechanism-level: ALC can provide controlled adaptation benefits in this setup, but current results do not justify broad claims beyond this scope.
 
 \subsection{Ablations}
-Ablation results over slot count, update rate, routing mode, and fusion mode are exported to \texttt{paper/tables/ablation\_results.csv}. The best observed setting in this sweep is top-k softmax with additive fusion at 8 slots and update rate 0.5.
+Ablation results over slot count, update rate, routing mode, and fusion mode are exported to \texttt{paper/tables/ablation\_results.csv}. The top-10 single-run ablations are listed below.
+
+\begin{table}[h]
+\centering
+\begin{tabular}{ll}
+\toprule
+\input{tables/ablation_top10.tex}
+\bottomrule
+\end{tabular}
+\caption{Top-10 ablation variants by recall MSE in the reference run (lower is better).}
+\end{table}
