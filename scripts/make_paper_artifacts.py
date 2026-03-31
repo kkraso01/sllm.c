@@ -85,6 +85,15 @@ for r in abl_rows[:10]:
     ablation_tex_rows.append(f"{r['variant'].replace('_', '\\_')} & {float(r['value']):.4f} {row_end}")
 (root / 'tables' / 'ablation_top10.tex').write_text('\n'.join(ablation_tex_rows) + '\n')
 
+tinyqa_tex = [f'Delay & Baseline & ALC no-write & ALC full {row_end}', '\\midrule']
+for d in [0, 4, 8]:
+    tinyqa_tex.append(
+        f"{d} & {fmt_ms('tinyqa', 'baseline', f'qa_acc_delay_{d}', 3)} & "
+        f"{fmt_ms('tinyqa', 'alc_no_write', f'qa_acc_delay_{d}', 3)} & "
+        f"{fmt_ms('tinyqa', 'alc', f'qa_acc_delay_{d}', 3)} {row_end}"
+    )
+(root / 'tables' / 'tinyqa_results.tex').write_text('\n'.join(tinyqa_tex) + '\n')
+
 try:
     import matplotlib.pyplot as plt
 
