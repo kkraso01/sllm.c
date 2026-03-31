@@ -313,15 +313,22 @@ See `docs/adaptive_learning_component.md` for the full architecture/design notes
 
 This clone also includes a separate experimental CPU path with MoE + expert-local memory in `train_gpt2_moe_experimental.c`.
 
-Current milestone: **top-2 routed experts with real backward/training support** and **expert-local weighted writes**.
+Current milestone: **top-2 routed trainable experts + auxiliary MoE load balancing** and **expert-local weighted writes**.
 
 - Router picks top-k experts (`LLMC_MOE_TOPK`, default `2`) and normalizes selected weights with router temperature (`LLMC_MOE_ROUTER_TEMPERATURE`, default `1.0`).
 - Each selected expert runs its own FFN and its own local memory read/write path.
 - Final MoE output is the weighted sum of selected expert outputs.
 - Backward now propagates through weighted top-2 combine and selected-softmax router weights.
+- Auxiliary load balancing uses per-layer batch stats:
+  - importance = average router probability mass per expert
+  - load = average top-k selection frequency per expert
+  - \(L_{balance} = \lambda \cdot E \sum_e importance_e \cdot load_e\)
+- The balancing gradient is added to router logits/params during backward (it is not logging-only).
+- Configure with `LLMC_MOE_LOAD_BALANCE_COEF` (default `0.01`, set `0` to disable).
 - Selected expert FFN params and router params now receive gradients and optimizer updates; non-selected experts remain zero-gradient for that token.
 - Selected expert writes are scaled by router weights; non-selected experts are not updated.
 - Expert-local memory writes remain stateful EMA updates in this milestone.
+- Set `LLMC_MOE_DEBUG=1` for `[MOE]` utilization output (tokens/expert, average probability mass, zero-traffic experts, balancing loss).
 
 Artifact-independent MoE validation:
 

@@ -567,6 +567,7 @@ typedef struct {
     float moe_memory_update_rate; // EMA update rate for expert-local writes
     float moe_memory_fusion_scale; // additive fusion scale for expert memory readout
     float moe_router_temperature; // router softmax temperature (>0)
+    float moe_load_balance_coef; // auxiliary load-balance loss coefficient (0 disables)
 } MoEConfig;
 
 typedef struct {
@@ -587,6 +588,10 @@ typedef struct {
     int* selected_expert; // (B*T, K)
     float* selected_expert_weight; // (B*T, K)
     float* retrieved_buffer; // (B*T, C)
+    float* layer_importance_sum; // (L, E) sum of router probabilities over active tokens
+    float* layer_load_count; // (L, E) count of top-k expert selections over active tokens
+    int* layer_active_tokens; // (L) number of active MoE tokens used for stats
+    float* layer_balance_loss; // (L) cached auxiliary balance loss value
     // trainable gradient buffers
     float* d_router_w; // (E, C)
     float* d_router_b; // (E)
@@ -853,6 +858,7 @@ typedef struct {
     int* inputs; // the input tokens for the current forward pass
     int* targets; // the target tokens for the current forward pass
     float mean_loss; // after a forward pass with targets, will be populated with the mean loss
+    float moe_aux_loss; // auxiliary MoE balancing loss added to mean_loss when enabled
 } GPT2;
 
 static int moe_layer_enabled(const GPT2* model, int layer) {
@@ -883,6 +889,10 @@ static void gpt2_validate_moe_config(const GPT2* model) {
         fprintf(stderr, "[MoE] invalid moe_router_temperature=%.6f (must be >0)\n", cfg->moe_router_temperature);
         exit(1);
     }
+    if (cfg->moe_load_balance_coef < 0.0f) {
+        fprintf(stderr, "[MoE] invalid moe_load_balance_coef=%.6f (must be >=0)\n", cfg->moe_load_balance_coef);
+        exit(1);
+    }
 }
 
 static void gpt2_init_moe_state(GPT2* model, int B, int T) {
@@ -894,6 +904,7 @@ static void gpt2_init_moe_state(GPT2* model, int B, int T) {
     int D = model->moe_config.moe_expert_memory_dim;
     int K = model->moe_config.moe_topk;
     int BT = B * T;
+    int L = model->config.num_layers;
     if (model->moe.initialized) {
         if (model->moe.scratch_bt != BT || model->moe.scratch_topk != K) {
             free(model->moe.router_logits);
@@ -902,12 +913,20 @@ static void gpt2_init_moe_state(GPT2* model, int B, int T) {
             free(model->moe.selected_expert);
             free(model->moe.selected_expert_weight);
             free(model->moe.retrieved_buffer);
+            free(model->moe.layer_importance_sum);
+            free(model->moe.layer_load_count);
+            free(model->moe.layer_active_tokens);
+            free(model->moe.layer_balance_loss);
             model->moe.router_logits = (float*)mallocCheck((size_t)BT * E * sizeof(float));
             model->moe.router_probs = (float*)mallocCheck((size_t)BT * E * sizeof(float));
             model->moe.memory_probs = (float*)mallocCheck((size_t)BT * K * S * sizeof(float));
             model->moe.selected_expert = (int*)mallocCheck((size_t)BT * K * sizeof(int));
             model->moe.selected_expert_weight = (float*)mallocCheck((size_t)BT * K * sizeof(float));
             model->moe.retrieved_buffer = (float*)mallocCheck((size_t)BT * C * sizeof(float));
+            model->moe.layer_importance_sum = (float*)calloc((size_t)L * E, sizeof(float));
+            model->moe.layer_load_count = (float*)calloc((size_t)L * E, sizeof(float));
+            model->moe.layer_active_tokens = (int*)calloc((size_t)L, sizeof(int));
+            model->moe.layer_balance_loss = (float*)calloc((size_t)L, sizeof(float));
             model->moe.scratch_bt = BT;
             model->moe.scratch_topk = K;
         }
@@ -932,6 +951,10 @@ static void gpt2_init_moe_state(GPT2* model, int B, int T) {
     model->moe.selected_expert = (int*)mallocCheck((size_t)BT * K * sizeof(int));
     model->moe.selected_expert_weight = (float*)mallocCheck((size_t)BT * K * sizeof(float));
     model->moe.retrieved_buffer = (float*)mallocCheck((size_t)BT * C * sizeof(float));
+    model->moe.layer_importance_sum = (float*)calloc((size_t)L * E, sizeof(float));
+    model->moe.layer_load_count = (float*)calloc((size_t)L * E, sizeof(float));
+    model->moe.layer_active_tokens = (int*)calloc((size_t)L, sizeof(int));
+    model->moe.layer_balance_loss = (float*)calloc((size_t)L, sizeof(float));
     model->moe.d_router_w = (float*)calloc((size_t)E * C, sizeof(float));
     model->moe.d_router_b = (float*)calloc((size_t)E, sizeof(float));
     model->moe.d_expert_fcw = (float*)calloc((size_t)E * (4 * C) * C, sizeof(float));
@@ -995,7 +1018,34 @@ static void moe_select_topk_softmax(const float* logits, int E, int K, float inv
     for (int k = 0; k < K; k++) { selected_w[k] *= inv_sum; }
 }
 
-static void moe_forward_topk_expert_local(GPT2* model, float* l_ln2, float* l_fcproj, int B, int T, int C) {
+static void moe_reset_batch_stats(GPT2* model) {
+    if (!model->moe_config.use_moe || !model->moe.initialized || model->moe.layer_importance_sum == NULL) { return; }
+    int L = model->config.num_layers;
+    int E = model->moe_config.moe_num_experts;
+    memset(model->moe.layer_importance_sum, 0, (size_t)L * E * sizeof(float));
+    memset(model->moe.layer_load_count, 0, (size_t)L * E * sizeof(float));
+    memset(model->moe.layer_active_tokens, 0, (size_t)L * sizeof(int));
+    memset(model->moe.layer_balance_loss, 0, (size_t)L * sizeof(float));
+}
+
+static float moe_compute_balance_loss_layer(GPT2* model, int layer) {
+    if (!model->moe_config.use_moe || model->moe_config.moe_load_balance_coef <= 0.0f) { return 0.0f; }
+    int E = model->moe_config.moe_num_experts;
+    int N = model->moe.layer_active_tokens[layer];
+    if (N <= 0) { return 0.0f; }
+    float inv_n = 1.0f / (float)N;
+    float sum = 0.0f;
+    float* imp_sum = model->moe.layer_importance_sum + (size_t)layer * E;
+    float* load_count = model->moe.layer_load_count + (size_t)layer * E;
+    for (int e = 0; e < E; e++) {
+        float importance = imp_sum[e] * inv_n;
+        float load = load_count[e] * inv_n;
+        sum += importance * load;
+    }
+    return model->moe_config.moe_load_balance_coef * (float)E * sum;
+}
+
+static void moe_forward_topk_expert_local(GPT2* model, int layer, float* l_ln2, float* l_fcproj, int B, int T, int C) {
     if (!model->moe_config.use_moe) { return; }
     int BT = B * T;
     int E = model->moe_config.moe_num_experts;
@@ -1027,10 +1077,14 @@ static void moe_forward_topk_expert_local(GPT2* model, float* l_ln2, float* l_fc
         }
         float inv_sum = sum_exp > 0.0f ? 1.0f / sum_exp : 0.0f;
         for (int e = 0; e < E; e++) { probs[e] *= inv_sum; }
+        float* imp_sum = model->moe.layer_importance_sum + (size_t)layer * E;
+        for (int e = 0; e < E; e++) { imp_sum[e] += probs[e]; }
 
         int* selected = model->moe.selected_expert + (size_t)bt * K;
         float* selected_w = model->moe.selected_expert_weight + (size_t)bt * K;
         moe_select_topk_softmax(logits, E, K, inv_tau, selected, selected_w);
+        float* load_count = model->moe.layer_load_count + (size_t)layer * E;
+        for (int k = 0; k < K; k++) { load_count[selected[k]] += 1.0f; }
 
         float* bt_out = l_fcproj + (size_t)bt * C;
         float* retrieved = model->moe.retrieved_buffer + (size_t)bt * C;
@@ -1136,6 +1190,8 @@ static void moe_forward_topk_expert_local(GPT2* model, float* l_ln2, float* l_fc
             fprintf(stderr, "\n");
         }
     }
+    model->moe.layer_active_tokens[layer] += BT;
+    model->moe.layer_balance_loss[layer] = moe_compute_balance_loss_layer(model, layer);
 }
 
 static float gelu_grad_scalar(float x) {
@@ -1160,7 +1216,7 @@ static void moe_zero_param_grads(GPT2* model) {
     memset(model->moe.d_expert_fcprojb, 0, (size_t)E * C * sizeof(float));
 }
 
-static void moe_backward_topk_expert_local(GPT2* model, const float* l_ln2, const float* dl_fcproj, float* dl_ln2, int B, int T, int C) {
+static void moe_backward_topk_expert_local(GPT2* model, int layer, const float* l_ln2, const float* dl_fcproj, float* dl_ln2, int B, int T, int C) {
     if (!model->moe_config.use_moe || !model->moe.initialized) { return; }
     int BT = B * T;
     int E = model->moe_config.moe_num_experts;
@@ -1170,6 +1226,20 @@ static void moe_backward_topk_expert_local(GPT2* model, const float* l_ln2, cons
     float scale = model->moe_config.moe_memory_fusion_scale;
     float inv_tau = 1.0f / model->moe_config.moe_router_temperature;
     float inv_sqrt_d = 1.0f / sqrtf((float)D);
+    int N = model->moe.layer_active_tokens[layer];
+    float aux_g[E];
+    int has_aux = model->moe_config.moe_load_balance_coef > 0.0f && N > 0;
+    if (has_aux) {
+        float inv_n = 1.0f / (float)N;
+        float coef = model->moe_config.moe_load_balance_coef * (float)E * inv_n;
+        const float* load_count = model->moe.layer_load_count + (size_t)layer * E;
+        for (int e = 0; e < E; e++) {
+            float load = load_count[e] * inv_n;
+            aux_g[e] = coef * load;
+        }
+    } else {
+        memset(aux_g, 0, (size_t)E * sizeof(float));
+    }
 
     for (int bt = 0; bt < BT; bt++) {
         const float* h = l_ln2 + (size_t)bt * C;
@@ -1264,6 +1334,22 @@ static void moe_backward_topk_expert_local(GPT2* model, const float* l_ln2, cons
             for (int c = 0; c < C; c++) {
                 d_rw[c] += dlogit * h[c];
                 dh[c] += dlogit * rw[c];
+            }
+        }
+
+        if (has_aux) {
+            const float* probs = model->moe.router_probs + (size_t)bt * E;
+            float expected_g = 0.0f;
+            for (int e = 0; e < E; e++) { expected_g += probs[e] * aux_g[e]; }
+            for (int e = 0; e < E; e++) {
+                float dlogit = inv_tau * probs[e] * (aux_g[e] - expected_g);
+                model->moe.d_router_b[e] += dlogit;
+                float* d_rw = model->moe.d_router_w + (size_t)e * C;
+                const float* rw = model->moe.router_w + (size_t)e * C;
+                for (int c = 0; c < C; c++) {
+                    d_rw[c] += dlogit * h[c];
+                    dh[c] += dlogit * rw[c];
+                }
             }
         }
 
@@ -2066,6 +2152,7 @@ void gpt2_build_from_checkpoint(GPT2 *model, const char* checkpoint_path) {
     model->batch_size = 0;
     model->seq_len = 0;
     model->mean_loss = -1.0f; // -1.0f will designate no loss
+    model->moe_aux_loss = 0.0f;
     model->alc_config = (ALCConfig){
         .use_alc = 0,
         .alc_num_slots = 64,
@@ -2092,6 +2179,7 @@ void gpt2_build_from_checkpoint(GPT2 *model, const char* checkpoint_path) {
         .moe_memory_update_rate = 0.05f,
         .moe_memory_fusion_scale = 0.1f,
         .moe_router_temperature = 1.0f,
+        .moe_load_balance_coef = 0.01f,
     };
     memset(&model->moe, 0, sizeof(MoEState));
 }
@@ -2120,6 +2208,7 @@ void gpt2_build_from_synthetic(GPT2 *model, GPT2Config config) {
     model->batch_size = 0;
     model->seq_len = 0;
     model->mean_loss = -1.0f;
+    model->moe_aux_loss = 0.0f;
     int C = model->config.channels;
     model->alc_config = (ALCConfig){
         .use_alc = 0,
@@ -2147,6 +2236,7 @@ void gpt2_build_from_synthetic(GPT2 *model, GPT2Config config) {
         .moe_memory_update_rate = 0.05f,
         .moe_memory_fusion_scale = 0.1f,
         .moe_router_temperature = 1.0f,
+        .moe_load_balance_coef = 0.01f,
     };
     memset(&model->moe, 0, sizeof(MoEState));
 }
@@ -2209,8 +2299,9 @@ void gpt2_forward(GPT2 *model, int* inputs, int* targets, size_t B, size_t T) {
 
     if (model->moe_config.use_moe) {
         gpt2_init_moe_state(model, B, T);
+        moe_reset_batch_stats(model);
         if (!model->moe.logged_enable_message) {
-            printf("[MoE-experimental] enabled: experts=%d topk=%d temperature=%.4f memory_slots=%d memory_dim=%d update_rate=%.4f fusion_scale=%.4f apply_every_n_layers=%d debug=%d\n",
+            printf("[MoE-experimental] enabled: experts=%d topk=%d temperature=%.4f memory_slots=%d memory_dim=%d update_rate=%.4f fusion_scale=%.4f load_balance_coef=%.6f apply_every_n_layers=%d debug=%d\n",
                    model->moe_config.moe_num_experts,
                    model->moe_config.moe_topk,
                    model->moe_config.moe_router_temperature,
@@ -2218,6 +2309,7 @@ void gpt2_forward(GPT2 *model, int* inputs, int* targets, size_t B, size_t T) {
                    model->moe_config.moe_expert_memory_dim,
                    model->moe_config.moe_memory_update_rate,
                    model->moe_config.moe_memory_fusion_scale,
+                   model->moe_config.moe_load_balance_coef,
                    model->moe_config.moe_apply_every_n_layers,
                    model->moe.debug_enabled);
             model->moe.logged_enable_message = 1;
@@ -2300,7 +2392,7 @@ void gpt2_forward(GPT2 *model, int* inputs, int* targets, size_t B, size_t T) {
             // Future extension points:
             // - global ALC remains after residual as a separate optional module
             // - Engram-like global memory can be inserted after expert fusion
-            moe_forward_topk_expert_local(model, l_ln2, l_fcproj, B, T, C);
+            moe_forward_topk_expert_local(model, l, l_ln2, l_fcproj, B, T, C);
         } else {
             matmul_forward(l_fch, l_ln2, l_fcw, l_fcb, B, T, C, 4*C);
             gelu_forward(l_fch_gelu, l_fch, B*T*4*C);
@@ -2348,10 +2440,38 @@ void gpt2_forward(GPT2 *model, int* inputs, int* targets, size_t B, size_t T) {
         float mean_loss = 0.0f;
         for (int i=0; i<B*T; i++) { mean_loss += model->acts.losses[i]; }
         mean_loss /= B*T;
-        model->mean_loss = mean_loss;
+        model->moe_aux_loss = 0.0f;
+        if (model->moe_config.use_moe && model->moe_config.moe_load_balance_coef > 0.0f) {
+            for (int l = 0; l < L; l++) {
+                if (moe_layer_enabled(model, l)) { model->moe_aux_loss += model->moe.layer_balance_loss[l]; }
+            }
+        }
+        model->mean_loss = mean_loss + model->moe_aux_loss;
     } else {
         // if we don't have targets, we don't have a loss
         model->mean_loss = -1.0f;
+        model->moe_aux_loss = 0.0f;
+    }
+
+    if (model->moe_config.use_moe && model->moe.debug_enabled) {
+        int E = model->moe_config.moe_num_experts;
+        int K = model->moe_config.moe_topk < E ? model->moe_config.moe_topk : E;
+        for (int l = 0; l < L; l++) {
+            if (!moe_layer_enabled(model, l)) { continue; }
+            int N = model->moe.layer_active_tokens[l];
+            if (N <= 0) { continue; }
+            float inv_n = 1.0f / (float)N;
+            int zero_experts = 0;
+            fprintf(stderr, "[MOE] layer=%d active_tokens=%d topk=%d balance_loss=%.6f", l, N, K, model->moe.layer_balance_loss[l]);
+            for (int e = 0; e < E; e++) {
+                float tokens = model->moe.layer_load_count[(size_t)l * E + e];
+                float imp = model->moe.layer_importance_sum[(size_t)l * E + e] * inv_n;
+                float load = tokens * inv_n;
+                if (tokens <= 0.0f) { zero_experts++; }
+                fprintf(stderr, " e%d(tokens=%.0f imp=%.4f load=%.4f)", e, tokens, imp, load);
+            }
+            fprintf(stderr, " zero_traffic=%d\n", zero_experts);
+        }
     }
 }
 
@@ -2466,7 +2586,7 @@ void gpt2_backward(GPT2 *model) {
         }
         residual_backward(dl_residual2, dl_fcproj, dl_residual3, B*T*C);
         if (moe_layer_enabled(model, l)) {
-            moe_backward_topk_expert_local(model, l_ln2, dl_fcproj, dl_ln2, B, T, C);
+            moe_backward_topk_expert_local(model, l, l_ln2, dl_fcproj, dl_ln2, B, T, C);
         } else {
             matmul_backward(dl_fch_gelu, dl_fcprojw, dl_fcprojb, dl_fcproj, l_fch_gelu, l_fcprojw, B, T, 4*C, C);
             gelu_backward(dl_fch, l_fch, dl_fch_gelu, B*T*4*C);
@@ -2605,6 +2725,10 @@ void gpt2_free(GPT2 *model) {
     free(model->moe.selected_expert);
     free(model->moe.selected_expert_weight);
     free(model->moe.retrieved_buffer);
+    free(model->moe.layer_importance_sum);
+    free(model->moe.layer_load_count);
+    free(model->moe.layer_active_tokens);
+    free(model->moe.layer_balance_loss);
     free(model->moe.d_router_w);
     free(model->moe.d_router_b);
     free(model->moe.d_expert_fcw);
@@ -2720,6 +2844,7 @@ int main() {
     model.moe_config.moe_memory_update_rate = env_get_float("LLMC_MOE_MEMORY_UPDATE_RATE", model.moe_config.moe_memory_update_rate);
     model.moe_config.moe_memory_fusion_scale = env_get_float("LLMC_MOE_MEMORY_FUSION_SCALE", model.moe_config.moe_memory_fusion_scale);
     model.moe_config.moe_router_temperature = env_get_float("LLMC_MOE_ROUTER_TEMPERATURE", model.moe_config.moe_router_temperature);
+    model.moe_config.moe_load_balance_coef = env_get_float("LLMC_MOE_LOAD_BALANCE_COEF", model.moe_config.moe_load_balance_coef);
     model.moe.debug_enabled = env_get_int("LLMC_MOE_DEBUG", 0);
 
     // build the DataLoaders from tokens files. for now use tiny_shakespeare if available, else tiny_stories

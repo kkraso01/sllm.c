@@ -1,5 +1,18 @@
 # MoE Expert-Local Memory Design (Experimental Path)
 
+## Stage 1 audit of router training path for load balancing (this pass)
+
+Audit findings in `train_gpt2_moe_experimental.c` before this load-balancing milestone:
+
+- **Router gradient path existed only through selected-topk weights.** `moe_backward_topk_expert_local` already propagated `dL/dlogit` from weighted expert output combine, but no auxiliary balancing term was present.
+- **Routing scratch was sufficient for insertion.** Per-token full router probabilities (`router_probs`) and selected experts (`selected_expert`) were already materialized in forward and reused in backward.
+- **Clean collection point:** usage statistics can be collected directly in `moe_forward_topk_expert_local` immediately after router softmax and top-k selection, without changing top-2 semantics.
+- **Minimal-disruption insertion point:** auxiliary loss gradients can be added in `moe_backward_topk_expert_local` as an extra `dlogit` contribution from full softmax probabilities, then accumulated into `d_router_w/d_router_b` exactly where router grads are already handled.
+
+This pass implements that plan end-to-end.
+
+---
+
 ## Stage 1 audit of `train_gpt2_moe_experimental.c` (before this training pass)
 
 This audit captures what existed immediately before enabling MoE backward/training:
@@ -111,37 +124,77 @@ These now have:
 
 ---
 
-## Why training support comes before load balancing
+## Load-balancing math implemented in this pass
 
-Load balancing is only meaningful once the routed path is demonstrably learnable.
+Per MoE-enabled layer, over active MoE tokens \(N\) and experts \(E\):
 
-This pass establishes that:
+\[
+\text{importance}_e=\frac{1}{N}\sum_{t=1}^{N} p_{t,e}
+\]
+\[
+\text{load}_e=\frac{1}{N}\sum_{t=1}^{N}\mathbf{1}[e\in\text{TopK}(t)]
+\]
+\[
+L_{\text{balance,layer}}=\lambda\cdot E\sum_{e=1}^{E}\text{importance}_e\cdot\text{load}_e
+\]
 
-- selected experts receive gradients and updates,
-- non-selected experts remain isolated,
-- router parameters receive gradients and update,
-- forward behavior changes after optimizer steps.
+Implementation details:
 
-With those fundamentals in place, auxiliary balancing losses can be added on a correct training substrate instead of masking routing/backward bugs.
+- `importance` is computed from full router softmax probabilities (`router_probs`).
+- `load` is computed from actual top-k selections (`selected_expert`), so it reflects discrete traffic.
+- Layer losses are summed into `model->moe_aux_loss`, and `model->mean_loss = cross_entropy_mean + moe_aux_loss` when targets are present.
 
----
+### Auxiliary gradient path into router logits
 
-## Current status (implemented now)
+`load` is treated as fixed statistics for the current batch/layer (standard MoE practice with non-differentiable top-k indicators). Thus:
 
-- MoE-enabled layers no longer fail-fast in `gpt2_backward`.
-- Top-2 weighted-combine backward is implemented.
-- Selected-softmax router backward is implemented.
-- Selected expert FFN backward is implemented with isolation.
-- MoE router + expert FFN params are integrated into AdamW updates.
-- Artifact-independent tests now cover gradient/update isolation and post-step behavior change.
+\[
+\frac{\partial L_{\text{balance}}}{\partial p_{t,e}}=\lambda\cdot E\cdot \frac{\text{load}_e}{N}
+\]
 
-## Deferred (explicitly not in this pass)
+With router temperature \(\tau\), logits \(z\), and softmax \(p\):
 
-- Load-balancing / auxiliary routing loss
-- Distributed MoE
-- Production checkpointing of MoE tensors
-- Pulling global ALC into MoE internals
-- Full differentiation through stateful EMA writes
+\[
+\frac{\partial L}{\partial z_{t,e}}=\frac{1}{\tau}p_{t,e}\left(g_e-\sum_j p_{t,j}g_j\right)
+\]
+
+where \(g_e=\lambda\cdot E\cdot \frac{\text{load}_e}{N}\).
+
+This `dlogit` is added to the existing router gradient path in `moe_backward_topk_expert_local`, and therefore updates `router_w/router_b` via the existing AdamW integration.
+
+## Stats and observability added
+
+`MoEState` now keeps per-layer batch stats:
+
+- `layer_importance_sum[L,E]`
+- `layer_load_count[L,E]`
+- `layer_active_tokens[L]`
+- `layer_balance_loss[L]`
+
+When `LLMC_MOE_DEBUG=1`, `[MOE]` lines report per-layer:
+
+- active token count,
+- tokens per expert,
+- average importance and load per expert,
+- number of zero-traffic experts,
+- balancing loss value.
+
+## Config knobs and defaults
+
+- `moe_load_balance_coef` (default `0.01`) and env override `LLMC_MOE_LOAD_BALANCE_COEF`.
+- `moe_load_balance_coef=0` disables auxiliary balancing.
+- Auxiliary loss remains zero when MoE is disabled.
+
+## Why load balancing is the next step after top-2 training
+
+Now that top-2 routing, selected-expert training, and router updates are wired correctly, expert-collapse is the dominant failure mode. Load balancing is the minimal next mechanism that directly regularizes router usage without redesigning the MoE architecture.
+
+## Limitations
+
+- `load` uses hard top-k indicators; gradients from the balancing term flow only through `importance` (softmax probabilities), not through discrete selection decisions.
+- Balancing is currently global over active tokens in each MoE-enabled layer and does not include per-sequence or per-head constraints.
+- No distributed/global-expert balancing is included.
+- Stateful EMA memory writes remain non-differentiable by design.
 
 ---
 
