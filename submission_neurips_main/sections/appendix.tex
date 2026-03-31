@@ -1,0 +1,23 @@
+\section{Appendix}
+\subsection{Reproducibility artifacts}
+Raw and summarized outputs used in this package:
+\begin{itemize}
+  \item \texttt{results/metrics.csv}
+  \item \texttt{results/summary.json}
+  \item \texttt{results/multiseed\_raw.csv}
+  \item \texttt{results/multiseed\_summary.csv}
+  \item \texttt{results/multiseed\_summary.json}
+  \item \texttt{results/sessionkv\_results.csv}
+  \item \texttt{results/sessionkv\_summary.json}
+  \item \texttt{results/tinyqa\_results.csv}
+  \item \texttt{results/tinyqa\_summary.json}
+\end{itemize}
+
+\subsection{Seeds and reporting}
+Multi-seed runs use seeds \{42, 1337, 2027, 31415, 27182\} when available, with mean, sample standard deviation, and 95\% confidence intervals reported in summary artifacts.
+
+\subsection{Build command}
+To regenerate canonical artifacts in the repository root:
+\begin{verbatim}
+./scripts/run_alc_publication_suite.sh
+\end{verbatim}

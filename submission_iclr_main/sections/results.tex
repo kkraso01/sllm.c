@@ -1,0 +1,49 @@
+\section{Results}
+We interpret SessionKV-DR as mechanism-level evidence rather than broad task validation. The baseline/no-write/full protocol helps separate gains from generic priors and highlights where writing specifically contributes.
+
+Observed improvements in delayed session recall and overwrite/persistence behavior support the intended mechanism in this implementation. At the same time, competitive no-write slices indicate unresolved routing and interference regimes, which we treat as substantive limitations rather than noise.
+
+TinyQA provides supporting signals but does not alter the primary claim boundary.
+
+\subsection{Primary evidence: SessionKV-DR}
+\begin{table}[h]
+\centering
+\begin{tabular}{llll}
+\toprule
+\input{tables/sessionkv_main.tex}
+\bottomrule
+\end{tabular}
+\caption{SessionKV-DR delayed recall (mean $\pm$ std, 95\% CI, n=5).}
+\end{table}
+
+\begin{table}[h]
+\centering
+\begin{tabular}{llll}
+\toprule
+\input{tables/sessionkv_overwrite.tex}
+\bottomrule
+\end{tabular}
+\caption{SessionKV-DR overwrite and persistence metrics (mean $\pm$ std, 95\% CI, n=5 where available).}
+\end{table}
+
+\begin{table}[h]
+\centering
+\begin{tabular}{llll}
+\toprule
+\input{tables/sessionkv_capacity.tex}
+\bottomrule
+\end{tabular}
+\caption{SessionKV-DR capacity/interference sweep.}
+\end{table}
+
+\subsection{Supporting evidence: TinyQA}
+\begin{table}[h]
+\centering
+\begin{tabular}{llll}
+\toprule
+\input{tables/tinyqa_results.tex}
+\bottomrule
+\end{tabular}
+\caption{TinyQA delayed QA accuracy (supporting evidence only).}
+\end{table}
+

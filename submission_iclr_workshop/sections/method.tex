@@ -1,0 +1,10 @@
+\section{Method}
+ALC maintains slot values and slot keys. Given hidden state $h$, the module computes a query $q=W_q h$, routes with scaled similarity over keys, and reads a weighted slot mixture. The read vector is projected back to hidden space and fused (additive or gated). During update, a write projection produces a write vector that updates selected slots/keys using routing-weighted EMA.
+
+Key properties used in this paper:
+\begin{itemize}
+  \item Differentiable routing modes (softmax / top-k softmax).
+  \item Stateful updates to slots/keys without changing base model weights at inference.
+  \item Sidecar persistence for exact state save/load.
+  \item Hardened numerical guards (stability checks, bounded operations).
+\end{itemize}

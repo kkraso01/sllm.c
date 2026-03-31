@@ -1,0 +1,49 @@
+\section{Results}
+SessionKV-DR is the primary evidence source because benchmark success depends on write/retain/retrieve operations under delay and interference. We therefore interpret these results as mechanism-level validation rather than general NLP performance claims.
+
+All reported comparisons include baseline, ALC no-write, and full ALC. This triad is essential: improvements over baseline support the memory hypothesis, while competitive no-write outcomes identify remaining write-policy and interference limits.
+
+TinyQA results are reported as supporting semi-realistic evidence. They are useful for sanity checking language-shaped tasks, but they do not replace the targeted mechanism evaluations in SessionKV-DR.
+
+\subsection{Primary evidence: SessionKV-DR}
+\begin{table}[h]
+\centering
+\begin{tabular}{llll}
+\toprule
+\input{tables/sessionkv_main.tex}
+\bottomrule
+\end{tabular}
+\caption{SessionKV-DR delayed recall (mean $\pm$ std, 95\% CI, n=5).}
+\end{table}
+
+\begin{table}[h]
+\centering
+\begin{tabular}{llll}
+\toprule
+\input{tables/sessionkv_overwrite.tex}
+\bottomrule
+\end{tabular}
+\caption{SessionKV-DR overwrite and persistence metrics (mean $\pm$ std, 95\% CI, n=5 where available).}
+\end{table}
+
+\begin{table}[h]
+\centering
+\begin{tabular}{llll}
+\toprule
+\input{tables/sessionkv_capacity.tex}
+\bottomrule
+\end{tabular}
+\caption{SessionKV-DR capacity/interference sweep.}
+\end{table}
+
+\subsection{Supporting evidence: TinyQA}
+\begin{table}[h]
+\centering
+\begin{tabular}{llll}
+\toprule
+\input{tables/tinyqa_results.tex}
+\bottomrule
+\end{tabular}
+\caption{TinyQA delayed QA accuracy (supporting evidence only).}
+\end{table}
+

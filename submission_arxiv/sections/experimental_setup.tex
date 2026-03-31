@@ -1,0 +1,32 @@
+\section{Experimental Setup}
+We run deterministic, in-repo experiments against the finalized C ALC implementation, with no core architecture changes in this pass. The evaluation is reorganized so the primary benchmark directly tests ALC's intended function: inference-time writing, delayed retention under interference, later retrieval, overwrite adaptation, and save/reload persistence.
+
+\subsection{Primary benchmark: SessionKV-DR}
+SessionKV-DR (Session Key-Value Delayed Recall) is the centerpiece benchmark. In each episode, session-specific key-value facts are written during inference, then queried after controlled delays and distractor updates.
+
+Every primary result compares the same three variants:
+\begin{itemize}
+  \item \textbf{baseline}: no effective ALC retrieval/write contribution,
+  \item \textbf{ALC no-write}: ALC read path active, writes disabled,
+  \item \textbf{ALC full}: ALC read+write enabled.
+\end{itemize}
+
+SessionKV-DR sub-evaluations:
+\begin{itemize}
+  \item \textbf{Delayed recall sweep}: accuracy vs delay and inserted fact count.
+  \item \textbf{Overwrite/update}: update a previously written key and test latest-value recall; report stale-value confusion.
+  \item \textbf{Persistence}: write facts, save state, reload in fresh state, query without reinsertion.
+  \item \textbf{Capacity/interference}: accuracy vs distractor count and fact load.
+\end{itemize}
+
+Primary artifacts are exported to \texttt{paper/results/sessionkv\_results.csv}, \texttt{paper/results/sessionkv\_summary.json}, and tables \texttt{paper/tables/sessionkv\_main.tex}, \texttt{sessionkv\_overwrite.tex}, and \texttt{sessionkv\_capacity.tex}.
+
+\subsection{Supporting benchmarks and checks}
+TinyQA is retained as a semi-realistic supporting benchmark (not primary evidence for the write/retain/retrieve claim). We also retain stability, persistence diagnostics, trainability, ablations, and a tiny efficiency check for continuity with prior package outputs.
+
+\subsection{Reproducibility and aggregation}
+All artifacts are generated via:
+\begin{verbatim}
+./scripts/run_alc_publication_suite.sh
+\end{verbatim}
+Multi-seed execution uses 5 seeds (42, 1337, 2027, 31415, 27182) and reports mean, sample standard deviation, and 95\% confidence intervals in \texttt{paper/results/multiseed\_summary.csv} and \texttt{paper/results/multiseed\_summary.json}.

@@ -1,0 +1,4 @@
+\section{Related Work}
+Prior memory-augmented language models include recurrent activation memory, memory-token extensions, and nearest-neighbor external stores. Retrieval-heavy systems improve factual access via external corpora, while test-time adaptation methods modify parameters, prompts, or hidden-state procedures during deployment.
+
+ALC is positioned as a structured in-model state mechanism: runtime memory is explicit, mutable, and persisted through a sidecar API, while base transformer weights remain unchanged at inference. Our evidence does not claim broad superiority over retrieval or parameter-adaptation methods. Instead, it isolates a mechanism-level question about controlled delayed recall, overwrite behavior, and persistence contracts.

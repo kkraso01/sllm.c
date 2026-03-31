@@ -1,0 +1,6 @@
+\section{Introduction}
+Inference-time adaptation is often needed when new information appears after deployment, but full parameter updates can be operationally expensive or unstable. ALC addresses this with structured mutable state inside the model runtime.
+
+This workshop version emphasizes mechanism novelty and claim-aligned evaluation. SessionKV-DR is designed to test the exact write-retain-retrieve behavior that ALC is intended to provide, including overwrite and persistence checks.
+
+Our contribution is not a broad benchmark sweep. Instead, we provide targeted evidence that inference-time memory writes can improve delayed session-specific recall in a controlled setting, alongside transparent failure modes and follow-up directions.

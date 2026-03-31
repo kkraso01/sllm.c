@@ -1,0 +1,6 @@
+\section{Introduction}
+Many deployment settings require incorporating newly observed information at inference time while keeping base model weights fixed. ALC targets this regime with explicit mutable state, differentiable routing, and controlled write/read operations.
+
+This arXiv version is written as the canonical public record for the current implementation and evidence. The central empirical question is narrow and testable: do inference-time writes to ALC improve delayed session-specific recall and update behavior in a controlled setting?
+
+To answer this, we foreground SessionKV-DR, a benchmark designed around write-retain-retrieve causality instead of generic language priors. We report baseline, ALC no-write, and full ALC with multi-seed aggregation, and keep mixed outcomes visible when no-write remains competitive. TinyQA and additional diagnostics are retained as supporting context rather than primary proof.

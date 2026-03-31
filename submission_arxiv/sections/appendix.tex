@@ -1,0 +1,37 @@
+\section{Appendix}
+\subsection{Reproducibility artifacts}
+Raw and summarized outputs used in this package:
+\begin{itemize}
+  \item \texttt{results/metrics.csv}
+  \item \texttt{results/summary.json}
+  \item \texttt{results/multiseed\_raw.csv}
+  \item \texttt{results/multiseed\_summary.csv}
+  \item \texttt{results/multiseed\_summary.json}
+  \item \texttt{results/sessionkv\_results.csv}
+  \item \texttt{results/sessionkv\_summary.json}
+  \item \texttt{results/tinyqa\_results.csv}
+  \item \texttt{results/tinyqa\_summary.json}
+\end{itemize}
+
+\subsection{Seeds and reporting}
+Multi-seed runs use seeds \{42, 1337, 2027, 31415, 27182\} when available, with mean, sample standard deviation, and 95\% confidence intervals reported in summary artifacts.
+
+\subsection{Build command}
+To regenerate canonical artifacts in the repository root:
+\begin{verbatim}
+./scripts/run_alc_publication_suite.sh
+\end{verbatim}
+
+\subsection{Implementation detail notes}
+ALC writes are routed using the same differentiable routing family used at read time, with runtime guards to bound unstable updates. Sidecar persistence serializes slot keys/values and validates shape compatibility at reload.
+
+\subsection{Artifact traceability}
+Primary tables in this submission are generated from the same canonical files under \texttt{paper/results/} and \texttt{paper/tables/}. This package intentionally reuses those artifacts to keep numbers identical across venue variants.
+
+\subsection{Reproducibility checklist}
+\begin{itemize}
+  \item Entry command: \texttt{./scripts/run\_alc\_publication\_suite.sh}.
+  \item Multi-seed set: \{42, 1337, 2027, 31415, 27182\}.
+  \item Reported statistics: mean, sample std, 95\% CI where applicable.
+  \item Environment caveat: figure PNG generation may be skipped when matplotlib is unavailable; tabular artifacts remain complete.
+\end{itemize}
