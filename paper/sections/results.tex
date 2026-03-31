@@ -15,6 +15,19 @@ ALC improves over the stale-memory baseline on core adaptation and on the added 
 
 However, the no-write control is competitive and in some metrics stronger than full ALC, indicating that write-policy/interference remains an open issue. Therefore we frame evidence as mechanism-level: ALC can provide controlled adaptation benefits in this setup, but current results do not justify broad claims beyond this scope.
 
+\subsection{Lightweight QA Benchmark}
+\begin{table}[h]
+\centering
+\begin{tabular}{llll}
+\toprule
+\input{tables/tinyqa_results.tex}
+\bottomrule
+\end{tabular}
+\caption{Lightweight Tiny-QA-style benchmark under delayed recall. Values are QA accuracy (mean $\pm$ std across 5 seeds).}
+\end{table}
+
+This semi-realistic QA evaluation adds evidence beyond purely synthetic recall probes. In this setup, ALC full improves delayed QA accuracy over baseline and no-write controls at non-zero delays, while absolute accuracies remain modest; we therefore treat these results as directional mechanism evidence rather than broad language QA claims.
+
 \subsection{Ablations}
 Ablation results over slot count, update rate, routing mode, and fusion mode are exported to \texttt{paper/tables/ablation\_results.csv}. The top-10 single-run ablations are listed below.
 

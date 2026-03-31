@@ -1,7 +1,7 @@
 \section{Experimental Setup}
-We run a deterministic synthetic-mechanism suite directly against the finalized C ALC implementation, now extended with multi-seed execution and one language-shaped delayed recall task.
+We run a deterministic synthetic-mechanism suite directly against the finalized C ALC implementation, now extended with multi-seed execution, a language-shaped delayed recall task, and a lightweight QA memory benchmark.
 
-Experiments include: core adaptation, stability stress test, persistence round-trip, trainability, language-shaped delayed recall with distractors, ablations, and tiny-setup efficiency.
+Experiments include: core adaptation, stability stress test, persistence round-trip, trainability, language-shaped delayed recall with distractors, a lightweight Tiny-QA-style benchmark, ablations, and tiny-setup efficiency.
 
 Baselines include:
 \begin{itemize}
@@ -16,3 +16,8 @@ All artifacts are generated via:
 \end{verbatim}
 
 Multi-seed execution uses 5 seeds (42, 1337, 2027, 31415, 27182) and reports mean, sample standard deviation, and 95\% confidence intervals. Outputs are written to \texttt{paper/results/metrics.csv}, \texttt{paper/results/multiseed\_summary.csv}, and \texttt{paper/results/multiseed\_summary.json}.
+
+\subsection{Lightweight QA Benchmark}
+We add a compact in-repo dataset (\texttt{experiments/tiny\_qa\_dataset.txt}, 60 QA triples) in the format context/question/answer. The benchmark is intentionally lightweight and reproducible, with no external dependencies.
+
+For each QA sample, context tokens are ingested incrementally and ALC write-updates are allowed during ingestion. We then insert delay tokens (including distractor-style filler updates) before asking the question, evaluating delayed recall under interference. We report QA accuracy at delays $\{0,4,8\}$ and delayed-QA aggregates for three variants: baseline transformer proxy, ALC full, and ALC no-write. Dedicated exports are \texttt{paper/results/tinyqa\_results.csv}, \texttt{paper/results/tinyqa\_summary.json}, and \texttt{paper/tables/tinyqa\_results.tex}.

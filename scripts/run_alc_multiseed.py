@@ -86,4 +86,41 @@ with (OUT / 'multiseed_summary.csv').open('w', newline='') as f:
         w.writerow(r)
 
 (OUT / 'multiseed_summary.json').write_text(json.dumps(summary_json, indent=2))
+
+# TinyQA-focused exports for the paper section/table.
+tinyqa_rows = []
+for r in all_rows:
+    if r['experiment'] != 'tinyqa':
+        continue
+    metric = r['metric']
+    if not metric.startswith('qa_acc_delay_'):
+        continue
+    delay = int(metric.split('_')[-1])
+    tinyqa_rows.append({
+        'seed': int(r['seed']),
+        'variant': r['variant'],
+        'delay': delay,
+        'qa_acc': float(r['value']),
+    })
+
+with (OUT / 'tinyqa_results.csv').open('w', newline='') as f:
+    w = csv.DictWriter(f, fieldnames=['seed', 'variant', 'delay', 'qa_acc'])
+    w.writeheader()
+    for r in sorted(tinyqa_rows, key=lambda x: (x['variant'], x['delay'], x['seed'])):
+        w.writerow(r)
+
+tinyqa_by_key = defaultdict(list)
+for r in tinyqa_rows:
+    tinyqa_by_key[(r['variant'], r['delay'])].append(r['qa_acc'])
+
+tinyqa_summary = {}
+for (variant, delay), vals in sorted(tinyqa_by_key.items()):
+    tinyqa_summary.setdefault(variant, {})[f'delay_{delay}'] = {
+        'n_seeds': len(vals),
+        'mean': mean(vals),
+        'std': std_sample(vals),
+        'values': vals,
+    }
+
+(OUT / 'tinyqa_summary.json').write_text(json.dumps(tinyqa_summary, indent=2))
 print(f'Wrote multi-seed outputs for {len(SEEDS)} seeds to {OUT}')

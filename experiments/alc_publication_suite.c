@@ -1,5 +1,6 @@
 #define TESTING
 #include "../train_gpt2.c"
+#include <ctype.h>
 #include <time.h>
 
 static float frand_sym(void) { return ((float)rand() / (float)RAND_MAX) * 2.0f - 1.0f; }
@@ -439,6 +440,240 @@ static void run_efficiency(FILE* f) {
     gpt2_free(&m); free(in); free(tg);
 }
 
+typedef struct {
+    char context[320];
+    char question[160];
+    char answer[64];
+} TinyQASample;
+
+typedef struct {
+    char label[64];
+    float vec[8];
+} TinyQAAnswerEmbedding;
+
+static uint32_t tinyqa_hash(const char* s) {
+    uint32_t h = 2166136261u;
+    while (*s) {
+        h ^= (uint8_t)(*s++);
+        h *= 16777619u;
+    }
+    return h;
+}
+
+static void tinyqa_normalize_token(char* out, size_t outcap, const char* in) {
+    size_t j = 0;
+    for (size_t i = 0; in[i] && j + 1 < outcap; i++) {
+        unsigned char c = (unsigned char)in[i];
+        if (isalnum(c)) out[j++] = (char)tolower(c);
+    }
+    out[j] = '\0';
+}
+
+static int tinyqa_load_dataset(const char* path, TinyQASample** out_samples) {
+    FILE* f = fopen(path, "r");
+    if (!f) return 0;
+    int cap = 128;
+    int n = 0;
+    TinyQASample* samples = (TinyQASample*)mallocCheck((size_t)cap * sizeof(TinyQASample));
+    char line[1024];
+    while (fgets(line, sizeof(line), f)) {
+        char* ctx = strtok(line, "\t");
+        char* q = strtok(NULL, "\t");
+        char* a = strtok(NULL, "\t\r\n");
+        if (!ctx || !q || !a) continue;
+        if (n >= cap) {
+            cap *= 2;
+            TinyQASample* grown = (TinyQASample*)realloc(samples, (size_t)cap * sizeof(TinyQASample));
+            if (!grown) {
+                free(samples);
+                fclose(f);
+                return 0;
+            }
+            samples = grown;
+        }
+        snprintf(samples[n].context, sizeof(samples[n].context), "%s", ctx);
+        snprintf(samples[n].question, sizeof(samples[n].question), "%s", q);
+        snprintf(samples[n].answer, sizeof(samples[n].answer), "%s", a);
+        n++;
+    }
+    fclose(f);
+    *out_samples = samples;
+    return n;
+}
+
+static void tinyqa_text_vec(const char* text, float* out, int dim) {
+    for (int i = 0; i < dim; i++) out[i] = 0.0f;
+    char buf[512];
+    snprintf(buf, sizeof(buf), "%s", text);
+    char* tok = strtok(buf, " ");
+    int t = 0;
+    while (tok) {
+        char norm[64];
+        tinyqa_normalize_token(norm, sizeof(norm), tok);
+        uint32_t h = tinyqa_hash(norm);
+        for (int i = 0; i < dim; i++) {
+            float v = (float)(((h >> (i % 24)) & 0xFFu)) / 255.0f;
+            out[i] += (v - 0.5f) * (1.2f + 0.1f * (float)((t + i) % 3));
+        }
+        t++;
+        tok = strtok(NULL, " ");
+    }
+    float n = 1e-6f;
+    for (int i = 0; i < dim; i++) n += out[i] * out[i];
+    n = sqrtf(n);
+    for (int i = 0; i < dim; i++) out[i] /= n;
+}
+
+static float tinyqa_cosine(const float* a, const float* b, int n) {
+    float dot = 0.0f, na = 1e-6f, nb = 1e-6f;
+    for (int i = 0; i < n; i++) {
+        dot += a[i] * b[i];
+        na += a[i] * a[i];
+        nb += b[i] * b[i];
+    }
+    return dot / (sqrtf(na) * sqrtf(nb));
+}
+
+static const char* tinyqa_predict_answer(const float* pred, TinyQAAnswerEmbedding* ans, int n_ans, int dim) {
+    int best = 0;
+    float best_score = -1e9f;
+    for (int i = 0; i < n_ans; i++) {
+        float s = tinyqa_cosine(pred, ans[i].vec, dim);
+        if (s > best_score) {
+            best_score = s;
+            best = i;
+        }
+    }
+    return ans[best].label;
+}
+
+static int tinyqa_answer_vocab(TinyQASample* samples, int n, TinyQAAnswerEmbedding* ans, int max_ans, int dim) {
+    int n_ans = 0;
+    for (int i = 0; i < n; i++) {
+        int found = 0;
+        for (int j = 0; j < n_ans; j++) if (strcmp(ans[j].label, samples[i].answer) == 0) found = 1;
+        if (found) continue;
+        if (n_ans >= max_ans) break;
+        snprintf(ans[n_ans].label, sizeof(ans[n_ans].label), "%s", samples[i].answer);
+        tinyqa_text_vec(samples[i].answer, ans[n_ans].vec, dim);
+        n_ans++;
+    }
+    return n_ans;
+}
+
+static float tinyqa_eval_variant(GPT2* m, TinyQASample* samples, int n_samples, TinyQAAnswerEmbedding* answers, int n_answers, int delay_tokens, int allow_write) {
+    const int C = m->config.channels;
+    const int key_dim = m->alc_config.alc_key_dim;
+    const int val_dim = m->alc_config.alc_slot_dim;
+    const int value_offset = 16;
+    int correct = 0;
+    int B = 1, T = 1;
+    for (int i = 0; i < n_samples; i++) {
+        memset(m->alc.slots, 0, (size_t)m->alc_config.alc_num_slots * m->alc_config.alc_slot_dim * sizeof(float));
+        memset(m->alc.slot_keys, 0, (size_t)m->alc_config.alc_num_slots * m->alc_config.alc_key_dim * sizeof(float));
+        float q_key[8], a_vec[8];
+        tinyqa_text_vec(samples[i].question, q_key, key_dim);
+        tinyqa_text_vec(samples[i].answer, a_vec, val_dim);
+
+        char ctxbuf[384];
+        snprintf(ctxbuf, sizeof(ctxbuf), "%s", samples[i].context);
+        char* tok = strtok(ctxbuf, " ");
+        while (tok) {
+            float h[32] = {0};
+            char norm[64];
+            tinyqa_normalize_token(norm, sizeof(norm), tok);
+            uint32_t hh = tinyqa_hash(norm);
+            for (int c = 0; c < C; c++) h[c] = 0.02f * (float)(((hh >> (c % 24)) & 0xFFu) - 127) / 127.0f;
+            for (int k = 0; k < key_dim; k++) h[k] += 0.7f * q_key[k];
+            if (strcmp(norm, samples[i].answer) == 0) {
+                for (int d = 0; d < val_dim; d++) h[value_offset + d] += 1.8f * a_vec[d];
+            }
+            alc_forward_read_and_fuse(m, h, B, T, 0);
+            if (allow_write) alc_write_update(m, h, B, T);
+            tok = strtok(NULL, " ");
+        }
+        for (int dly = 0; dly < delay_tokens; dly++) {
+            float h[32] = {0};
+            uint32_t hh = tinyqa_hash((dly % 2 == 0) ? "filler" : "distractor");
+            for (int c = 0; c < C; c++) h[c] = 0.03f * (float)(((hh >> (c % 24)) & 0xFFu) - 127) / 127.0f;
+            for (int k = 0; k < key_dim; k++) h[k] += 0.15f * ((float)rand() / RAND_MAX - 0.5f);
+            for (int d = 0; d < val_dim; d++) h[value_offset + d] += 0.15f * ((float)rand() / RAND_MAX - 0.5f);
+            alc_forward_read_and_fuse(m, h, B, T, 0);
+            if (allow_write) alc_write_update(m, h, B, T);
+        }
+        float q[32] = {0};
+        for (int k = 0; k < key_dim; k++) q[k] = q_key[k];
+        alc_forward_read_and_fuse(m, q, B, T, 0);
+        const char* pred = tinyqa_predict_answer(q + value_offset, answers, n_answers, val_dim);
+        if (strcmp(pred, samples[i].answer) == 0) correct++;
+    }
+    return (float)correct / (float)n_samples;
+}
+
+static void run_tinyqa(FILE* f) {
+    TinyQASample* samples = NULL;
+    int n_samples = tinyqa_load_dataset("experiments/tiny_qa_dataset.txt", &samples);
+    if (n_samples <= 0) return;
+
+    GPT2 m_alc; memset(&m_alc, 0, sizeof(m_alc));
+    m_alc.config.channels = 32; m_alc.config.num_layers = 1;
+    m_alc.alc_config = (ALCConfig){
+        .use_alc = 1, .alc_num_slots = 16, .alc_slot_dim = 8, .alc_key_dim = 8,
+        .alc_update_rate = 0.35f, .alc_fusion_mode = ALC_FUSION_ADDITIVE,
+        .alc_update_mode = ALC_UPDATE_ALWAYS, .alc_apply_every_n_layers = 1,
+        .alc_additive_scale = 1.0f, .alc_routing_mode = ALC_ROUTING_TOPK_SOFTMAX,
+        .alc_topk = 2, .alc_temperature = 0.8f,
+    };
+    GPT2 m_nowrite = m_alc;
+    m_nowrite.alc_config.alc_update_mode = ALC_UPDATE_OFF;
+    m_nowrite.alc_config.alc_update_rate = 0.0f;
+    GPT2 m_baseline = m_alc;
+    m_baseline.alc_config.alc_update_mode = ALC_UPDATE_OFF;
+    m_baseline.alc_config.alc_update_rate = 0.0f;
+    int B = 1, T = 1, value_offset = 16;
+    gpt2_init_alc_state(&m_alc, B, T);
+    gpt2_init_alc_state(&m_nowrite, B, T);
+    gpt2_init_alc_state(&m_baseline, B, T);
+    alc_ensure_layer_traces(&m_alc, B, T);
+    alc_ensure_layer_traces(&m_nowrite, B, T);
+    alc_ensure_layer_traces(&m_baseline, B, T);
+    setup_identity_interface(&m_alc, value_offset);
+    setup_identity_interface(&m_nowrite, value_offset);
+    setup_identity_interface(&m_baseline, value_offset);
+    zero_alc_projection(&m_baseline.alc, m_baseline.config.channels, m_baseline.alc_config.alc_slot_dim, m_baseline.alc_config.alc_key_dim);
+
+    TinyQAAnswerEmbedding answers[128];
+    int n_answers = tinyqa_answer_vocab(samples, n_samples, answers, 128, 8);
+    const int delays[] = {0, 4, 8};
+    float acc_sum[3] = {0}, acc_delay[3] = {0};
+    for (int di = 0; di < 3; di++) {
+        int d = delays[di];
+        acc_delay[0] = tinyqa_eval_variant(&m_baseline, samples, n_samples, answers, n_answers, d, 0);
+        acc_delay[1] = tinyqa_eval_variant(&m_alc, samples, n_samples, answers, n_answers, d, 1);
+        acc_delay[2] = tinyqa_eval_variant(&m_nowrite, samples, n_samples, answers, n_answers, d, 0);
+        acc_sum[0] += acc_delay[0];
+        acc_sum[1] += acc_delay[1];
+        acc_sum[2] += acc_delay[2];
+        fprintf(f, "tinyqa,baseline,qa_acc_delay_%d,%.8f\n", d, acc_delay[0]);
+        fprintf(f, "tinyqa,alc,qa_acc_delay_%d,%.8f\n", d, acc_delay[1]);
+        fprintf(f, "tinyqa,alc_no_write,qa_acc_delay_%d,%.8f\n", d, acc_delay[2]);
+        if (d > 0) {
+            fprintf(f, "tinyqa,baseline,delayed_qa_acc,%.8f\n", acc_delay[0]);
+            fprintf(f, "tinyqa,alc,delayed_qa_acc,%.8f\n", acc_delay[1]);
+            fprintf(f, "tinyqa,alc_no_write,delayed_qa_acc,%.8f\n", acc_delay[2]);
+        }
+    }
+    fprintf(f, "tinyqa,baseline,qa_acc_mean,%.8f\n", acc_sum[0] / 3.0f);
+    fprintf(f, "tinyqa,alc,qa_acc_mean,%.8f\n", acc_sum[1] / 3.0f);
+    fprintf(f, "tinyqa,alc_no_write,qa_acc_mean,%.8f\n", acc_sum[2] / 3.0f);
+    fprintf(f, "tinyqa,dataset,num_samples,%.8f\n", (float)n_samples);
+
+    free(samples);
+    gpt2_free(&m_alc);
+    gpt2_free(&m_nowrite);
+    gpt2_free(&m_baseline);
+}
+
 int main(int argc, char** argv) {
     const char* out_csv = (argc > 1) ? argv[1] : "paper/results/metrics.csv";
     const char* outdir = (argc > 2) ? argv[2] : "paper/results";
@@ -451,6 +686,7 @@ int main(int argc, char** argv) {
     run_persistence(f, outdir);
     run_trainability(f);
     run_language_shaped_benchmark(f);
+    run_tinyqa(f);
     run_ablations(f);
     run_efficiency(f);
     fcloseCheck(f);

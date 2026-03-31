@@ -6,4 +6,4 @@
 | Stability | nan_rate=0.000000, final_norm=0.635 |
 | Persistence | slot_diff=0.00e+00, behavior_diff=0.00e+00 |
 | Trainability | before=0.0942, after=0.0755 |
-| Efficiency | baseline=0.585ms, alc=0.600ms, ratio=1.02x |
+| Efficiency | baseline=0.571ms, alc=0.623ms, ratio=1.09x |
